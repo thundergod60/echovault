@@ -16,7 +16,7 @@ typedef __int64 LONG_PTR;
 typedef signed long LONG;
 typedef int BOOLEAN;
 typedef char CHAR;
-typedef short WCHAR;
+typedef wchar_t WCHAR;
 typedef void VOID;
 typedef void* PVOID;
 typedef const void* PCVOID;
@@ -89,6 +89,7 @@ typedef struct _FAST_MUTEX { char data[16]; } FAST_MUTEX, *PFAST_MUTEX;
 #define STATUS_INVALID_PARAMETER         ((NTSTATUS)0xC000000DL)
 #define STATUS_NOT_FOUND                 ((NTSTATUS)0xC0000225L)
 #define STATUS_INSUFFICIENT_RESOURCES    ((NTSTATUS)0xC000009AL)
+#define STATUS_BUFFER_TOO_SMALL           ((NTSTATUS)0xC0000023L)
 
 #define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
 #define UNREFERENCED_PARAMETER(P) ((void)(P))
@@ -121,7 +122,13 @@ void  ExInitializeFastMutex(PFAST_MUTEX M);
 void  ExAcquireFastMutex(PFAST_MUTEX M);
 void  ExReleaseFastMutex(PFAST_MUTEX M);
 void  KeInitializeSpinLock(KSPIN_LOCK* Lock);
-LARGE_INTEGER KeQueryTickCount(void);
+typedef LARGE_INTEGER* PLARGE_INTEGER;
+/* Faithful to the real wdm.h: KeQueryTickCount is a MACRO that writes
+   the tick count through a caller-provided LARGE_INTEGER pointer, and
+   returns nothing. Using it as a value-returning function is an error
+   in the real WDK too. */
+#define KeQueryTickCount(CurrentCount) \
+    (*(PLARGE_INTEGER)(CurrentCount)).QuadPart = 0
 void  ExAcquireSpinLock(KSPIN_LOCK* Lock, KIRQL* OldIrql);
 void  ExReleaseSpinLock(KSPIN_LOCK* Lock, KIRQL OldIrql);
 ULONG RtlRandomEx(PULONG Seed);
@@ -132,6 +139,9 @@ NTSTATUS RtlAnsiStringToUnicodeString(PUNICODE_STRING Dest, PCANSI_STRING Source
 BOOLEAN RtlEqualUnicodeString(PCUNICODE_STRING A, PCUNICODE_STRING B, BOOLEAN CaseInsensitive);
 
 PCHAR PsGetProcessImageFileName(PEPROCESS Process);
+NTSTATUS SeLocateProcessImageName(PEPROCESS Process, PUNICODE_STRING* ImageFileName);
+void  ExFreePool(void* P);
+NTSTATUS ZwQuerySymbolicLink(PUNICODE_STRING LinkName, PUNICODE_STRING TargetName);
 
 typedef enum _WORK_QUEUE_TYPE {
     CriticalWorkQueue, DelayedWorkQueue, HyperCriticalWorkQueue,

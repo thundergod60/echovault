@@ -152,6 +152,7 @@ NTSTATUS FltRegisterFilter(
     PFLT_FILTER* RetFilter);
 
 VOID FltUnregisterFilter(PFLT_FILTER Filter);
+NTSTATUS FltStartFiltering(PFLT_FILTER Filter);
 
 NTSTATUS FltBuildDefaultSecurityDescriptor(
     PSECURITY_DESCRIPTOR* SecuritDescriptor,
@@ -179,8 +180,8 @@ NTSTATUS FltSendMessage(
     PVOID SenderBuffer,
     ULONG SenderBufferLength,
     PVOID ReplyBuffer,
-    ULONG ReplyBufferLength,
-    PULONG BytesReturned);
+    PULONG ReplyLength,
+    PLARGE_INTEGER Timeout);
 
 NTSTATUS FltGetFileNameInformation(
     PFLT_CALLBACK_DATA CallbackData,

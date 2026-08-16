@@ -34,7 +34,13 @@
 //     and runs normally with today's user-mode behavior.
 //------------------------------------------------------------
 
-#include <ntddk.h>   // PsGetProcessImageFileName
+// Use the kernel branch of the shared gate logic (evtable.h): the full
+// Unicode case-insensitive compare (RtlEqualUnicodeString) instead of
+// the ASCII-only fold used by the user-mode test harness. fltkernel.h
+// does not define this flag itself.
+#define _FLT_KERNEL_MODE 1
+
+#include <ntddk.h>
 #include <fltKernel.h>
 #include "..\shared\evfilter.h"
 #include "..\shared\evtable.h"
@@ -105,28 +111,43 @@ typedef struct _EV_NOTIFY_CONTEXT {
     WCHAR RequesterApp[EVFILTER_MAX_APP];
 } EV_NOTIFY_CONTEXT;
 
-// Copies the requestor's image base name (ANSI) into a WCHAR buffer.
-// Best-effort: on any failure the buffer stays empty, and the guard
-// then falls back to the default program (harmless).
+// Captures the requestor's image base name (e.g. "notepad.exe") into a
+// WCHAR buffer. Best-effort: on any failure the buffer stays empty, and
+// the guard then falls back to the default program (harmless).
+// Uses SeLocateProcessImageName (ntifs.h, pulled in by fltKernel.h) —
+// the current documented API. It must run at PASSIVE_LEVEL, which holds
+// for IRP_MJ_CREATE pre-operation callbacks.
 static VOID EvCaptureRequesterApp(PEPROCESS proc, WCHAR* out, ULONG outChars)
 {
     if (!proc || !out || outChars == 0)
         return;
     out[0] = L'\0';
 
-    PCHAR img = PsGetProcessImageFileName(proc);
-    if (!img || img[0] == '\0')
+    // SeLocateProcessImageName allocates a UNICODE_STRING holding the
+    // FULL image path; the caller frees the structure with ExFreePool.
+    PUNICODE_STRING imageName = NULL;
+    if (!NT_SUCCESS(SeLocateProcessImageName(proc, &imageName)) || !imageName)
         return;
 
-    ANSI_STRING astr;
-    RtlInitAnsiString(&astr, img);
+    // Extract the base name (the part after the last '\').
+    ULONG chars = imageName->Length / sizeof(WCHAR);
+    ULONG base = 0;
+    for (ULONG i = chars; i > 0; i--)
+    {
+        if (imageName->Buffer[i - 1] == L'\\')
+        {
+            base = i;
+            break;
+        }
+    }
+    ULONG baseChars = chars - base;
+    if (baseChars > 0 && baseChars < outChars)
+    {
+        RtlCopyMemory(out, imageName->Buffer + base, baseChars * sizeof(WCHAR));
+        out[baseChars] = L'\0';
+    }
 
-    UNICODE_STRING ustr;
-    ustr.Buffer = out;
-    ustr.MaximumLength = (USHORT)(outChars * sizeof(WCHAR));
-    ustr.Length = 0;
-    if (NT_SUCCESS(RtlAnsiStringToUnicodeString(&ustr, &astr, FALSE)))
-        out[ustr.Length / sizeof(WCHAR)] = L'\0';
+    ExFreePool(imageName);
 }
 
 static VOID EvNotifyWorker(_In_ PVOID Context)
@@ -149,13 +170,11 @@ static VOID EvNotifyWorker(_In_ PVOID Context)
         RtlCopyMemory(notify.RequesterApp, c->RequesterApp,
             EVFILTER_MAX_APP * sizeof(WCHAR));
 
-        // Blocks until the guard replies. The guard replies immediately
-        // after receiving (before doing any prompting), so this returns
-        // quickly; if the guard is gone the port is closed and this
-        // fails immediately.
-        ULONG returned = 0;
+        // Fire-and-forget: no reply is needed. The guard receives the
+        // notification and pops the password dialog. If the guard is
+        // gone the port is closed and this fails immediately.
         FltSendMessage(gFilter, &client, &notify, sizeof(notify),
-            NULL, 0, &returned);
+            NULL, NULL, NULL);
     }
 
     ExFreePoolWithTag(c, EV_NOTIFY_TAG);
@@ -176,7 +195,9 @@ static VOID EvQueueDenyNotification(const UNICODE_STRING* name, const WCHAR* app
     KIRQL irql;
     ExAcquireSpinLock(&gPortLock, &irql);
 
-    ULONG tick = (ULONG)KeQueryTickCount().QuadPart;
+    LARGE_INTEGER tickCount;
+    KeQueryTickCount(&tickCount);
+    ULONG tick = (ULONG)(tickCount.QuadPart & 0xFFFFFFFF);
     BOOLEAN throttled =
         (gLastNotifyTick != 0) &&
         (tick - gLastNotifyTick < EV_NOTIFY_THROTTLE_TICKS) &&
@@ -210,6 +231,15 @@ static VOID EvQueueDenyNotification(const UNICODE_STRING* name, const WCHAR* app
     ExInitializeWorkItem(&c->Wq, EvNotifyWorker, c);
     ExQueueWorkItem(&c->Wq, DelayedWorkQueue);
 }
+
+// ---- Path-form translation -------------------------------------
+// The filter manager's normalized names are DEVICE paths
+// (\Device\HarddiskVolume1\...), while user mode registers DRIVE
+// LETTER / UNC paths (C:\..., \\server\share\...). The gate must
+// compare like with like, so incoming registration paths are
+// translated to device form. The logic lives in evdevpath.c so it can
+// be unit-tested in user mode; the same code runs in the kernel.
+#include "evdevpath.c"
 
 // ---- Communication port ---------------------------------------
 
@@ -284,6 +314,11 @@ static NTSTATUS EvMessageNotify(
 
     NTSTATUS status = STATUS_SUCCESS;
 
+    // Translate the registration path to the device form the gate
+    // compares against (normalized names are \Device\... paths).
+    UNICODE_STRING devPath;
+    EvToDevicePath(&path, &devPath);
+
     // Exclusions live in their own table/lock: they are config, not path
     // state, and they are accessed only when an open is about to be
     // denied, so keeping them out of the hot-path lock is right.
@@ -305,15 +340,19 @@ static NTSTATUS EvMessageNotify(
     ExAcquireFastMutex(&gLock);
     switch (m->OpCode)
     {
-        case EVFILTER_MSG_ADD:      status = EvMapStatus(evtAdd(&gTable, &path));      break;
-        case EVFILTER_MSG_ALLOW:    status = EvMapStatus(evtAllow(&gTable, &path));    break;
-        case EVFILTER_MSG_DISALLOW: status = EvMapStatus(evtDisallow(&gTable, &path)); break;
-        case EVFILTER_MSG_REMOVE:   status = EvMapStatus(evtRemove(&gTable, &path));   break;
-        case EVFILTER_MSG_CLEAR:    evtClear(&gTable);                                  break;
-        case EVFILTER_MSG_STATUS:                                                       break;
-        default:                    status = STATUS_INVALID_PARAMETER;                  break;
+        case EVFILTER_MSG_ADD:      status = EvMapStatus(evtAdd(&gTable, &devPath));      break;
+        case EVFILTER_MSG_ALLOW:    status = EvMapStatus(evtAllow(&gTable, &devPath));    break;
+        case EVFILTER_MSG_DISALLOW: status = EvMapStatus(evtDisallow(&gTable, &devPath)); break;
+        case EVFILTER_MSG_REMOVE:   status = EvMapStatus(evtRemove(&gTable, &devPath));   break;
+        case EVFILTER_MSG_CLEAR:    evtClear(&gTable);                                    break;
+        case EVFILTER_MSG_STATUS:                                                         break;
+        default:                    status = STATUS_INVALID_PARAMETER;                    break;
     }
     ExReleaseFastMutex(&gLock);
+
+    if (devPath.Buffer != path.Buffer)
+        ExFreePool(devPath.Buffer);
+
     return status;
 }
 
@@ -503,6 +542,16 @@ DriverEntry(
 
     if (!NT_SUCCESS(status))
     {
+        FltUnregisterFilter(gFilter);
+        gFilter = NULL;
+        return status;
+    }
+
+    status = FltStartFiltering(gFilter);
+    if (!NT_SUCCESS(status))
+    {
+        FltCloseCommunicationPort(gServerPort);
+        gServerPort = NULL;
         FltUnregisterFilter(gFilter);
         gFilter = NULL;
         return status;
