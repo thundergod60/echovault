@@ -40,8 +40,15 @@
 // does not define this flag itself.
 #define _FLT_KERNEL_MODE 1
 
-#include <ntddk.h>
+// IMPORTANT: fltKernel.h must come BEFORE ntddk.h. fltKernel.h pulls in
+// ntifs.h, which defines _NTIFS_INCLUDED_ so wdm.h types PEPROCESS and
+// PETHREAD consistently (as struct _KPROCESS*). Including ntddk.h first
+// makes wdm.h use its default definitions (struct _EPROCESS*), and then
+// ntifs.h redefines them with different types (MSVC error C2371).
+// fltKernel.h includes ntddk.h transitively, so the explicit include
+// below is just for clarity.
 #include <fltKernel.h>
+#include <ntddk.h>
 #include "..\shared\evfilter.h"
 #include "..\shared\evtable.h"
 

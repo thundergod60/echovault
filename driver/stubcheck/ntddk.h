@@ -26,6 +26,8 @@ typedef WCHAR* PWSTR;
 typedef const WCHAR* PCWSTR;
 typedef WCHAR* PWCH;
 typedef ULONG* PULONG;
+typedef void* HANDLE;
+typedef HANDLE* PHANDLE;
 typedef size_t SIZE_T;
 
 #ifndef TRUE
@@ -53,17 +55,10 @@ typedef ULONG_PTR KSPIN_LOCK;
 typedef UCHAR KIRQL;
 typedef void* PEPROCESS;
 typedef void* PSECURITY_DESCRIPTOR;
+typedef void* HANDLE;
 typedef LONG NTSTATUS;
 typedef long long LONGLONG;
 typedef struct _LARGE_INTEGER { LONGLONG QuadPart; } LARGE_INTEGER;
-typedef struct _OBJECT_ATTRIBUTES {
-    ULONG Length;
-    PVOID RootDirectory;
-    PVOID ObjectName;
-    ULONG Attributes;
-    PVOID SecurityDescriptor;
-    PVOID SecurityQualityOfService;
-} OBJECT_ATTRIBUTES, *POBJECT_ATTRIBUTES;
 
 typedef struct _ANSI_STRING {
     USHORT Length;
@@ -78,6 +73,15 @@ typedef struct _UNICODE_STRING {
     PWSTR  Buffer;
 } UNICODE_STRING, *PUNICODE_STRING;
 typedef const UNICODE_STRING* PCUNICODE_STRING;
+
+typedef struct _OBJECT_ATTRIBUTES {
+    ULONG Length;
+    PVOID RootDirectory;
+    PUNICODE_STRING ObjectName;
+    ULONG Attributes;
+    PVOID SecurityDescriptor;
+    PVOID SecurityQualityOfService;
+} OBJECT_ATTRIBUTES, *POBJECT_ATTRIBUTES;
 
 typedef struct _DRIVER_OBJECT { int placeholder; } DRIVER_OBJECT, *PDRIVER_OBJECT;
 
@@ -141,7 +145,10 @@ BOOLEAN RtlEqualUnicodeString(PCUNICODE_STRING A, PCUNICODE_STRING B, BOOLEAN Ca
 PCHAR PsGetProcessImageFileName(PEPROCESS Process);
 NTSTATUS SeLocateProcessImageName(PEPROCESS Process, PUNICODE_STRING* ImageFileName);
 void  ExFreePool(void* P);
-NTSTATUS ZwQuerySymbolicLink(PUNICODE_STRING LinkName, PUNICODE_STRING TargetName);
+NTSTATUS ZwOpenSymbolicLinkObject(PHANDLE LinkHandle, ULONG DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes);
+NTSTATUS ZwQuerySymbolicLinkObject(HANDLE LinkHandle, PUNICODE_STRING LinkTarget, PULONG ReturnedLength);
+NTSTATUS ZwClose(HANDLE Handle);
+#define GENERIC_READ 0x80000000L
 
 typedef enum _WORK_QUEUE_TYPE {
     CriticalWorkQueue, DelayedWorkQueue, HyperCriticalWorkQueue,

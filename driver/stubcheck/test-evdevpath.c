@@ -27,25 +27,58 @@ void ExFreePool(void* P) { free(P); }
 
 // Fake symbolic-link resolution: any "\??\X:" maps to
 // "\Device\HarddiskVolume1" (21 WCHARs).
-NTSTATUS ZwQuerySymbolicLink(PUNICODE_STRING LinkName, PUNICODE_STRING TargetName)
+NTSTATUS ZwOpenSymbolicLinkObject(PHANDLE LinkHandle, ULONG DesiredAccess, POBJECT_ATTRIBUTES ObjectAttributes)
 {
-    if (!LinkName || !LinkName->Buffer || !TargetName || !TargetName->Buffer)
+    (void)DesiredAccess;
+    if (!LinkHandle || !ObjectAttributes || !ObjectAttributes->ObjectName ||
+        !ObjectAttributes->ObjectName->Buffer)
         return STATUS_INVALID_PARAMETER;
-    if (LinkName->Length < 6 * sizeof(WCHAR) ||
-        LinkName->Buffer[0] != L'\\' || LinkName->Buffer[1] != L'?' ||
-        LinkName->Buffer[2] != L'?' || LinkName->Buffer[3] != L'\\' ||
-        LinkName->Buffer[5] != L':')
+
+    const UNICODE_STRING* name = ObjectAttributes->ObjectName;
+    if (name->Length < 6 * sizeof(WCHAR) ||
+        name->Buffer[0] != L'\\' || name->Buffer[1] != L'?' ||
+        name->Buffer[2] != L'?' || name->Buffer[3] != L'\\' ||
+        name->Buffer[5] != L':')
         return STATUS_NOT_FOUND;
+
+    *LinkHandle = (HANDLE)0x1234;
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS ZwQuerySymbolicLinkObject(HANDLE LinkHandle, PUNICODE_STRING LinkTarget, PULONG ReturnedLength)
+{
+    (void)LinkHandle;
+    if (ReturnedLength)
+        *ReturnedLength = 0;
+    if (!LinkTarget || !LinkTarget->Buffer)
+        return STATUS_INVALID_PARAMETER;
 
     static const WCHAR dev[] = L"\\Device\\HarddiskVolume1";
     ULONG devChars = (ULONG)(wcslen(dev));
-    if (TargetName->MaximumLength < (devChars + 1) * sizeof(WCHAR))
+    if (LinkTarget->MaximumLength < (devChars + 1) * sizeof(WCHAR))
         return STATUS_BUFFER_TOO_SMALL;
 
-    RtlCopyMemory(TargetName->Buffer, dev, devChars * sizeof(WCHAR));
-    TargetName->Buffer[devChars] = L'\0';
-    TargetName->Length = (USHORT)(devChars * sizeof(WCHAR));
+    RtlCopyMemory(LinkTarget->Buffer, dev, devChars * sizeof(WCHAR));
+    LinkTarget->Buffer[devChars] = L'\0';
+    LinkTarget->Length = (USHORT)(devChars * sizeof(WCHAR));
+    if (ReturnedLength)
+        *ReturnedLength = devChars * sizeof(WCHAR);
     return STATUS_SUCCESS;
+}
+
+NTSTATUS ZwClose(HANDLE Handle)
+{
+    (void)Handle;
+    return STATUS_SUCCESS;
+}
+
+VOID RtlInitUnicodeString(PUNICODE_STRING Dest, PCWSTR Source)
+{
+    if (!Dest || !Source)
+        return;
+    Dest->Buffer = (PWSTR)Source;
+    Dest->Length = (USHORT)(wcslen(Source) * sizeof(WCHAR));
+    Dest->MaximumLength = (USHORT)((wcslen(Source) + 1) * sizeof(WCHAR));
 }
 
 // ---- Include the code under test --------------------------------

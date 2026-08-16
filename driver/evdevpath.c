@@ -67,6 +67,9 @@ static VOID EvToDevicePath(const UNICODE_STRING* in, UNICODE_STRING* out)
 
     // Drive letter: X:\... -> resolve \??\X: then append the rest.
     // A separator '\' is always kept, so "C:\" stays a folder entry.
+    // Uses the modern handle-based symbolic-link API (ZwOpenSymbolicLink
+    // + ZwQuerySymbolicLinkObject); the legacy path-based ZwQuerySymbolicLink
+    // was removed from newer WDKs.
     if (chars >= 3 && in->Buffer[1] == L':' && in->Buffer[2] == L'\\')
     {
         WCHAR linkBuf[7];
@@ -74,39 +77,48 @@ static VOID EvToDevicePath(const UNICODE_STRING* in, UNICODE_STRING* out)
         linkBuf[3] = L'\\'; linkBuf[4] = in->Buffer[0]; linkBuf[5] = L':';
         linkBuf[6] = L'\0';
 
-        WCHAR targetBuf[128];
         UNICODE_STRING link;
-        link.Buffer = linkBuf;
-        link.Length = 6 * sizeof(WCHAR);
-        link.MaximumLength = sizeof(linkBuf);
+        RtlInitUnicodeString(&link, linkBuf);
 
-        UNICODE_STRING target;
-        target.Buffer = targetBuf;
-        target.Length = 0;
-        target.MaximumLength = sizeof(targetBuf);
+        OBJECT_ATTRIBUTES oa;
+        InitializeObjectAttributes(&oa, &link, OBJ_CASE_INSENSITIVE, NULL, NULL);
 
-        if (NT_SUCCESS(ZwQuerySymbolicLink(&link, &target)) && target.Length > 0)
+        HANDLE linkHandle = NULL;
+        if (NT_SUCCESS(ZwOpenSymbolicLinkObject(&linkHandle, GENERIC_READ, &oa)) &&
+            linkHandle != NULL)
         {
-            ULONG devChars = target.Length / sizeof(WCHAR);
-            ULONG restChars = chars - 3;
-            ULONG total = devChars + 1 + restChars;
-            if (total + 1 < EVFILTER_MAX_PATH)
+            WCHAR targetBuf[128];
+            UNICODE_STRING target;
+            target.Buffer = targetBuf;
+            target.Length = 0;
+            target.MaximumLength = sizeof(targetBuf);
+
+            if (NT_SUCCESS(ZwQuerySymbolicLinkObject(linkHandle, &target, NULL)) &&
+                target.Length > 0)
             {
-                WCHAR* buf = (WCHAR*)ExAllocatePool2(POOL_FLAG_NON_PAGED,
-                    (total + 1) * sizeof(WCHAR), EV_DEVICE_TAG);
-                if (buf)
+                ULONG devChars = target.Length / sizeof(WCHAR);
+                ULONG restChars = chars - 3;
+                ULONG total = devChars + 1 + restChars;
+                if (total + 1 < EVFILTER_MAX_PATH)
                 {
-                    RtlCopyMemory(buf, target.Buffer, devChars * sizeof(WCHAR));
-                    buf[devChars] = L'\\';
-                    RtlCopyMemory(buf + devChars + 1, in->Buffer + 3,
-                        restChars * sizeof(WCHAR));
-                    buf[total] = L'\0';
-                    out->Buffer = buf;
-                    out->Length = (USHORT)(total * sizeof(WCHAR));
-                    out->MaximumLength = (USHORT)((total + 1) * sizeof(WCHAR));
-                    return;
+                    WCHAR* buf = (WCHAR*)ExAllocatePool2(POOL_FLAG_NON_PAGED,
+                        (total + 1) * sizeof(WCHAR), EV_DEVICE_TAG);
+                    if (buf)
+                    {
+                        RtlCopyMemory(buf, target.Buffer, devChars * sizeof(WCHAR));
+                        buf[devChars] = L'\\';
+                        RtlCopyMemory(buf + devChars + 1, in->Buffer + 3,
+                            restChars * sizeof(WCHAR));
+                        buf[total] = L'\0';
+                        out->Buffer = buf;
+                        out->Length = (USHORT)(total * sizeof(WCHAR));
+                        out->MaximumLength = (USHORT)((total + 1) * sizeof(WCHAR));
+                        ZwClose(linkHandle);
+                        return;
+                    }
                 }
             }
+            ZwClose(linkHandle);
         }
     }
 
