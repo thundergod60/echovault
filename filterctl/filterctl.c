@@ -31,6 +31,7 @@
 //------------------------------------------------------------
 
 #include <windows.h>
+#include <winsvc.h>
 #include <stdio.h>
 #include <wchar.h>
 #include <stdlib.h>
@@ -98,6 +99,40 @@ static int RunCmd(const wchar_t* cmdline)
 
 // ---- verbs --------------------------------------------------------
 
+// Register the minifilter's altitude in the service registry key, the
+// way a driver INF normally would. Without an altitude the filter
+// manager can load the driver but will never attach it to any volume.
+static void RegSetStr(HKEY key, const wchar_t* name, const wchar_t* value)
+{
+    RegSetValueExW(key, name, 0, REG_SZ, (const BYTE*)value,
+                   (DWORD)((wcslen(value) + 1) * sizeof(wchar_t)));
+}
+
+static void RegisterFilterAltitude(const wchar_t* service,
+                                   const wchar_t* instance,
+                                   const wchar_t* altitude)
+{
+    wchar_t path[512];
+    HKEY hk;
+    wsprintfW(path, L"SYSTEM\\CurrentControlSet\\Services\\%s\\Instances", service);
+    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, path, 0, NULL, 0, KEY_SET_VALUE,
+                        NULL, &hk, NULL) == ERROR_SUCCESS)
+    {
+        RegSetStr(hk, L"DefaultInstance", instance);
+        RegCloseKey(hk);
+    }
+    wsprintfW(path, L"SYSTEM\\CurrentControlSet\\Services\\%s\\Instances\\%s",
+              service, instance);
+    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, path, 0, NULL, 0, KEY_SET_VALUE,
+                        NULL, &hk, NULL) == ERROR_SUCCESS)
+    {
+        RegSetStr(hk, L"Altitude", altitude);
+        DWORD flags = 0;
+        RegSetValueExW(hk, L"Flags", 0, REG_DWORD, (const BYTE*)&flags, sizeof(flags));
+        RegCloseKey(hk);
+    }
+}
+
 static int CmdLoad(int argc, wchar_t** wargv)
 {
     int force = 0;
@@ -152,11 +187,55 @@ static int CmdLoad(int argc, wchar_t** wargv)
         return 1;
     }
 
+    // Already running? Nothing to do.
+    {
+        SC_HANDLE mgr = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
+        if (mgr)
+        {
+            SC_HANDLE svc = OpenServiceW(mgr, L"EchoVaultFilter", SERVICE_QUERY_STATUS);
+            if (svc)
+            {
+                SERVICE_STATUS ss;
+                if (QueryServiceStatus(svc, &ss) && ss.dwCurrentState == SERVICE_RUNNING)
+                {
+                    CloseServiceHandle(svc);
+                    CloseServiceHandle(mgr);
+                    wprintf(L"OK: the driver is already loaded.\n");
+                    return 0;
+                }
+                CloseServiceHandle(svc);
+            }
+            CloseServiceHandle(mgr);
+        }
+    }
+
+    // Copy the driver to the canonical drivers directory. Kernel driver
+    // loads fail with "file not found" when the service ImagePath
+    // contains spaces, and this is the location the INF uses anyway.
+    wchar_t windir[MAX_PATH];
+    if (!GetWindowsDirectoryW(windir, MAX_PATH))
+        wcscpy(windir, L"C:\\Windows");
+    wchar_t destPath[MAX_PATH];
+    wsprintfW(destPath, L"%s\\System32\\drivers\\EchoVaultFilter.sys", windir);
+    if (!CopyFileW(sysPath, destPath, FALSE))
+    {
+        wprintf(L"ERROR: could not copy the driver to\n  %ls\n"
+                L"(error %lu). Run as administrator and make sure the\n"
+                L"source .sys is on a local drive.\n", destPath, GetLastError());
+        return 1;
+    }
+
+    // Recreate the service from scratch so a stale ImagePath from an
+    // earlier attempt can never poison the load ("not installed" and
+    // "does not exist" results are expected and ignored).
+    RunCmd(L"sc delete EchoVaultFilter");
+
     wchar_t cmd[2048];
-    // Register the kernel service if it doesn't exist yet ("already
-    // exists" is fine and is ignored).
-    wsprintfW(cmd, L"sc create EchoVaultFilter type= kernel binPath= \"%s\"", sysPath);
+    wsprintfW(cmd, L"sc create EchoVaultFilter type= kernel binPath= \"%s\"", destPath);
     RunCmd(cmd);
+
+    // Register the altitude (the INF normally does this).
+    RegisterFilterAltitude(L"EchoVaultFilter", L"EchoVaultFilter Instance", L"360000");
 
     // Attach the minifilter to Filter Manager.
     int rc = RunCmd(L"fltmc load EchoVaultFilter");
@@ -171,7 +250,8 @@ static int CmdLoad(int argc, wchar_t** wargv)
     FILETIME ft;
     GetSystemTimeAsFileTime(&ft);
     EvFsSetLoaded(((ULONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime);
-    wprintf(L"OK: driver loaded and registered. Off-switch: 'filterctl disable'.\n");
+    wprintf(L"OK: driver loaded and registered (installed at %ls).\n"
+            L"Off-switch: 'filterctl disable'.\n", destPath);
     return 0;
 }
 

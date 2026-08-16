@@ -22,14 +22,23 @@ CopyFiles = DriverFiles.NTamd64
 AddService = EchoVaultFilter,, EchoVaultFilter_Service_Inst
 
 [DriverFiles.NTamd64]
-EchoVaultFilter.sys = 12, \System32\drivers
+EchoVaultFilter.sys = 12
 
 [EchoVaultFilter_Service_Inst]
 DisplayName   = %ServiceName%
 ServiceType   = 2        ; SERVICE_FILE_SYSTEM_DRIVER
 StartType     = 3        ; SERVICE_DEMAND_START (fltmc load to start)
 ErrorControl  = 1        ; SERVICE_ERROR_NORMAL (boot continues on failure)
-ServiceBinary = %12%\System32\drivers\EchoVaultFilter.sys
+ServiceBinary = %12%\EchoVaultFilter.sys
+AddReg        = EchoVaultFilter_AddReg
+
+; The altitude is REQUIRED: the filter manager cannot attach a
+; minifilter to any volume without it. 360000 is the ActivityMonitor
+; class range (360000-369999).
+[EchoVaultFilter_AddReg]
+HKR, "Instances", "DefaultInstance", 0x00000000, "EchoVaultFilter Instance"
+HKR, "Instances\EchoVaultFilter Instance", "Altitude", 0x00000000, "360000"
+HKR, "Instances\EchoVaultFilter Instance", "Flags", 0x00010001, 0
 
 [Strings]
 ProviderName = "EchoVault"
