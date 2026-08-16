@@ -7,11 +7,18 @@
 # the finished EchoVaultFilter.sys as a downloadable artifact
 # (a few dozen KB). Your machine downloads only the result.
 #
+# How: this follows Microsoft's own driver CI (see the
+# Windows-driver-samples repo, .github/Build-with-GitHub.md):
+#   * windows-2025-vs2026 runner — Visual Studio preinstalled.
+#   * The WDK is restored as NuGet packages (packages.config +
+#     Directory.Build.props), which provide the headers, libs,
+#     and the WindowsKernelModeDriver10.0 platform toolset that
+#     the .vcxproj uses. No machine-wide WDK install needed.
+#
 # How to use:
-#   1. Push this project to a GitHub repository (the repo can be
-#      private or public; Actions is free for both).
+#   1. Push this project to a GitHub repository.
 #   2. Open the repo's "Actions" tab -> "Build EchoVault driver"
-#      -> "Run workflow" (or just push a change to driver/).
+#      (or just push a change to driver/).
 #   3. When it finishes, open the run, scroll to "Artifacts",
 #      download "EchoVaultFilter-sys".
 #------------------------------------------------------------
@@ -24,52 +31,48 @@ on:
     paths:
       - 'driver/**'
       - 'shared/**'
+      - 'packages.config'
+      - 'Directory.Build.props'
       - '.github/workflows/build-driver.yml'
 
 jobs:
   build-driver:
-    runs-on: windows-latest
+    runs-on: windows-2025-vs2026   # VS preinstalled; WDK comes from NuGet
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Visual Studio Build Tools (C++ workload)
+      - name: Restore WDK packages (NuGet)
         shell: pwsh
         run: |
-          winget install Microsoft.VisualStudio.2022.BuildTools --silent `
-            --accept-package-agreements --accept-source-agreements `
-            --override "--quiet --wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+          nuget restore packages.config -PackagesDirectory packages
 
-      - name: Install Windows Driver Kit
-        shell: pwsh
-        run: |
-          # The WDK's winget ID is versioned (Microsoft.WindowsWDK.10.0.<build>);
-          # "Microsoft.WindowsDriverKit.10" does not exist.
-          winget install Microsoft.WindowsWDK.10.0.26100 --silent `
-            --accept-package-agreements --accept-source-agreements
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
 
       - name: Build driver (x64 Release)
         shell: cmd
         run: |
-          call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
-          msbuild driver\EchoVaultFilter.vcxproj /p:Configuration=Release /p:Platform=x64 /m
+          msbuild driver\EchoVaultFilter.vcxproj /p:Configuration=Release /p:Platform=x64 /p:OutDir="%GITHUB_WORKSPACE%\driver\bin\x64\Release\" /p:IntDir="%GITHUB_WORKSPACE%\driver\obj\x64\Release\" /m
 
       - name: Verify the gate logic on a fresh machine (best-effort)
         # The deny/allow/exclusion logic test (shared/evtable.h) compiled
         # and run here, so the first run proves the decisions are sound
         # even before any kernel is involved. Best-effort: never blocks
-        # the artifact.
-        shell: cmd
+        # the artifact. Uses the preinstalled VS via vswhere.
+        shell: pwsh
         continue-on-error: true
         run: |
-          call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
-          cl /nologo /O2 /W3 driver\test-evtable.c /Fe:test-evtable.exe /link user32.lib
-          test-evtable.exe
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { Write-Host 'vswhere: no Visual Studio found; skipping gate check'; exit 0 }
+          $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
+          cmd /c "`"$vcvars`" >nul 2>&1 && cl /nologo /O2 /W3 driver\test-evtable.c /Fe:test-evtable.exe /link user32.lib && test-evtable.exe"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: EchoVaultFilter-sys
           path: |
-            driver/x64/Release/EchoVaultFilter.sys
+            driver/bin/x64/Release/EchoVaultFilter.sys
             driver/EchoVaultFilter.inf

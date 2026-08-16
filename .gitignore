@@ -7,6 +7,13 @@
 *.ilk
 output/
 
+# NuGet restore output (WDK/SDK packages — hundreds of MB, never commit)
+packages/
+
+# MSBuild driver build outputs (OutDir/IntDir overrides in CI)
+driver/bin/
+driver/obj/
+
 # Tool metadata
 .freebuff/
 

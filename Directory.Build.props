@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Directory.Build.props — makes the WDK/SDK available to MSBuild through
+  NuGet packages instead of a machine-wide WDK install. This mirrors the
+  approach used by microsoft/Windows-driver-samples CI: `nuget restore
+  packages.config` puts the packages under .\packages\, and these imports
+  point MSBuild at their headers, libs, and the WindowsKernelModeDriver10.0
+  platform toolset.
+-->
+<Project>
+  <Import Project="packages\Microsoft.Windows.WDK.x64.10.0.28000.2526\build\native\Microsoft.Windows.WDK.x64.props"
+          Condition="Exists('packages\Microsoft.Windows.WDK.x64.10.0.28000.2526\build\native\Microsoft.Windows.WDK.x64.props') and '$(Platform)' == 'x64'"/>
+  <Import Project="packages\Microsoft.Windows.SDK.CPP.x64.10.0.28000.2526\build\native\Microsoft.Windows.SDK.cpp.x64.props"
+          Condition="Exists('packages\Microsoft.Windows.SDK.CPP.x64.10.0.28000.2526\build\native\Microsoft.Windows.SDK.cpp.x64.props') and '$(Platform)' == 'x64'"/>
+  <Import Project="packages\Microsoft.Windows.SDK.CPP.10.0.28000.2526\build\native\Microsoft.Windows.SDK.cpp.props"
+          Condition="Exists('packages\Microsoft.Windows.SDK.CPP.10.0.28000.2526\build\native\Microsoft.Windows.SDK.cpp.props')"/>
+</Project>
