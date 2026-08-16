@@ -102,7 +102,17 @@ static NTSTATUS EvMapStatus(int rc)
 // dropped and the open is still denied.
 
 static KSPIN_LOCK gPortLock;
-static PFLT_PORT  gClientPort = NULL;
+
+// Multiple user-mode clients are connected at the same time: the guard
+// (long-lived listener for deny notifications) plus short-lived clients
+// (EchoVault app operations, filterctl). Track them all so that one
+// client disconnecting never cuts the others' notifications. The port
+// is created with this many connection slots (FltCreateCommunicationPort
+// below); with a single slot the guard would starve every other client
+// (FilterConnectCommunicationPort fails with ACCESS_DENIED when the
+// limit is reached).
+#define EV_MAX_CLIENTS 16
+static PFLT_PORT  gClients[EV_MAX_CLIENTS];
 
 // 2-second throttle: don't spam the guard with duplicate denies of
 // the same path (Explorer can retry opens rapidly).
@@ -161,27 +171,29 @@ static VOID EvNotifyWorker(_In_ PVOID Context)
 {
     EV_NOTIFY_CONTEXT* c = (EV_NOTIFY_CONTEXT*)Context;
 
-    PFLT_PORT client = NULL;
+    EVFILTER_NOTIFY notify;
+    RtlZeroMemory(&notify, sizeof(notify));
+    notify.OpCode = EVFILTER_NOTIFY_DENIED;
+    RtlCopyMemory(notify.Path, c->Path,
+        (evtPathChars(c->Path, EVFILTER_MAX_PATH) + 1) * sizeof(WCHAR));
+    RtlCopyMemory(notify.RequesterApp, c->RequesterApp,
+        EVFILTER_MAX_APP * sizeof(WCHAR));
+
+    // Snapshot the connected clients under the lock, then send to each
+    // outside it. Fire-and-forget: no reply is needed; a client that
+    // disconnected meanwhile just fails immediately and is skipped.
+    PFLT_PORT snapshot[EV_MAX_CLIENTS];
     KIRQL irql;
     ExAcquireSpinLock(&gPortLock, &irql);
-    client = gClientPort;
+    for (ULONG i = 0; i < EV_MAX_CLIENTS; i++)
+        snapshot[i] = gClients[i];
     ExReleaseSpinLock(&gPortLock, irql);
 
-    if (client)
+    for (ULONG i = 0; i < EV_MAX_CLIENTS; i++)
     {
-        EVFILTER_NOTIFY notify;
-        RtlZeroMemory(&notify, sizeof(notify));
-        notify.OpCode = EVFILTER_NOTIFY_DENIED;
-        RtlCopyMemory(notify.Path, c->Path,
-            (evtPathChars(c->Path, EVFILTER_MAX_PATH) + 1) * sizeof(WCHAR));
-        RtlCopyMemory(notify.RequesterApp, c->RequesterApp,
-            EVFILTER_MAX_APP * sizeof(WCHAR));
-
-        // Fire-and-forget: no reply is needed. The guard receives the
-        // notification and pops the password dialog. If the guard is
-        // gone the port is closed and this fails immediately.
-        FltSendMessage(gFilter, &client, &notify, sizeof(notify),
-            NULL, NULL, NULL);
+        if (snapshot[i])
+            FltSendMessage(gFilter, &snapshot[i], &notify, sizeof(notify),
+                NULL, NULL, NULL);
     }
 
     ExFreePoolWithTag(c, EV_NOTIFY_TAG);
@@ -211,7 +223,16 @@ static VOID EvQueueDenyNotification(const UNICODE_STRING* name, const WCHAR* app
         (chars == evtPathChars(gLastNotifyPath, EVFILTER_MAX_PATH)) &&
         RtlEqualMemory(name->Buffer, gLastNotifyPath, chars * sizeof(WCHAR));
 
-    if (throttled || gClientPort == NULL)
+    BOOLEAN anyClient = FALSE;
+    for (ULONG i = 0; i < EV_MAX_CLIENTS; i++)
+    {
+        if (gClients[i])
+        {
+            anyClient = TRUE;
+            break;
+        }
+    }
+    if (throttled || !anyClient)
     {
         ExReleaseSpinLock(&gPortLock, irql);
         return;
@@ -263,15 +284,14 @@ static NTSTATUS EvConnectNotify(
 
     KIRQL irql;
     ExAcquireSpinLock(&gPortLock, &irql);
-    if (gClientPort && gClientPort != ClientPort)
+    for (ULONG i = 0; i < EV_MAX_CLIENTS; i++)
     {
-        PFLT_PORT old = gClientPort;
-        gClientPort = NULL;
-        ExReleaseSpinLock(&gPortLock, irql);
-        FltCloseClientPort(gFilter, &old);
-        ExAcquireSpinLock(&gPortLock, &irql);
+        if (gClients[i] == NULL)
+        {
+            gClients[i] = ClientPort;
+            break;
+        }
     }
-    gClientPort = ClientPort;
     ExReleaseSpinLock(&gPortLock, irql);
 
     *ConnectionPortCookie = (PVOID)ClientPort;
@@ -284,7 +304,15 @@ static VOID EvDisconnectNotify(_In_opt_ PVOID ConnectionCookie)
 
     KIRQL irql;
     ExAcquireSpinLock(&gPortLock, &irql);
-    gClientPort = NULL;
+    PFLT_PORT who = (PFLT_PORT)ConnectionCookie;
+    for (ULONG i = 0; i < EV_MAX_CLIENTS; i++)
+    {
+        if (who ? (gClients[i] == who) : (gClients[i] != NULL))
+        {
+            gClients[i] = NULL;
+            break;
+        }
+    }
     gLastNotifyTick = 0;
     ExReleaseSpinLock(&gPortLock, irql);
 }
@@ -444,12 +472,19 @@ static NTSTATUS EvFilterUnload(_In_ FLT_FILTER_UNLOAD_FLAGS Flags)
 
     KIRQL irql;
     ExAcquireSpinLock(&gPortLock, &irql);
-    PFLT_PORT client = gClientPort;
-    gClientPort = NULL;
+    PFLT_PORT toClose[EV_MAX_CLIENTS];
+    for (ULONG i = 0; i < EV_MAX_CLIENTS; i++)
+    {
+        toClose[i] = gClients[i];
+        gClients[i] = NULL;
+    }
     gLastNotifyTick = 0;
     ExReleaseSpinLock(&gPortLock, irql);
-    if (client)
-        FltCloseClientPort(gFilter, &client);
+    for (ULONG i = 0; i < EV_MAX_CLIENTS; i++)
+    {
+        if (toClose[i])
+            FltCloseClientPort(gFilter, &toClose[i]);
+    }
 
     if (gServerPort)
     {
@@ -508,7 +543,8 @@ DriverEntry(
     ExInitializeFastMutex(&gExclLock);
     gExcl.count = 0;
     KeInitializeSpinLock(&gPortLock);
-    gClientPort = NULL;
+    for (ULONG i = 0; i < EV_MAX_CLIENTS; i++)
+        gClients[i] = NULL;
     gLastNotifyTick = 0;
     RtlZeroMemory(gLastNotifyPath, sizeof(gLastNotifyPath));
 
@@ -543,7 +579,7 @@ DriverEntry(
         OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
 
     status = FltCreateCommunicationPort(gFilter, &gServerPort, &oa, NULL,
-        EvConnectNotify, EvDisconnectNotify, EvMessageNotify, 1);
+        EvConnectNotify, EvDisconnectNotify, EvMessageNotify, EV_MAX_CLIENTS);
 
     FltFreeSecurityDescriptor(sd);
 
