@@ -426,18 +426,16 @@ static FLT_PREOP_CALLBACK_STATUS EvPreCreate(
 CONST FLT_OPERATION_REGISTRATION EvCallbacks[] = {
     { IRP_MJ_CREATE,
       FLTFL_OPERATION_REGISTRATION_SKIP_PAGING_IO,
-      EvPreCreate, NULL, NULL, 0 },
+      EvPreCreate, NULL, NULL },
     { IRP_MJ_OPERATION_END }
 };
 
 CONST FLT_REGISTRATION EvRegistration = {
-    sizeof(FLT_REGISTRATION),
-    FLT_REGISTRATION_VERSION,
+    sizeof(FLT_REGISTRATION),   // Size
+    FLT_REGISTRATION_VERSION,   // Version
     0,                          // Flags
     NULL,                       // ContextRegistration
     EvCallbacks,                // OperationRegistration
-    0,                          // NumberOfGenericCallbacks
-    NULL,                       // GenericOperationCallbacks
     EvFilterUnload,             // FilterUnloadCallback
     NULL,                       // InstanceSetup (attach to all volumes)
     NULL,                       // InstanceQueryTeardown
@@ -448,7 +446,7 @@ CONST FLT_REGISTRATION EvRegistration = {
     NULL,                       // NormalizeContextCleanup
     NULL,                       // TransactionNotification
     NULL,                       // NormalizeNameComponentEx
-    NULL, NULL, NULL, NULL, NULL, NULL    // Reserved0..5
+    NULL                        // SectionNotification
 };
 
 // ---- Entry point -----------------------------------------------

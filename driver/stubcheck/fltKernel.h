@@ -83,28 +83,30 @@ typedef FLT_PREOP_CALLBACK_STATUS (*PFLT_POST_OPERATION_CALLBACK)(
 #define IRP_MJ_OPERATION_END    0x80
 #define FLTFL_OPERATION_REGISTRATION_SKIP_PAGING_IO 0x00000001
 
+typedef ULONG FLT_OPERATION_REGISTRATION_FLAGS;
 typedef struct _FLT_OPERATION_REGISTRATION {
     UCHAR   MajorFunction;
-    ULONG   Flags;
+    FLT_OPERATION_REGISTRATION_FLAGS Flags;
     PFLT_PRE_OPERATION_CALLBACK  PreOperation;
     PFLT_POST_OPERATION_CALLBACK PostOperation;
     PVOID   Reserved1;
-    ULONG   Reserved2;
 } FLT_OPERATION_REGISTRATION;
 
 typedef ULONG FLT_FILTER_UNLOAD_FLAGS;
 typedef NTSTATUS (*PFLT_FILTER_UNLOAD_CALLBACK)(FLT_FILTER_UNLOAD_FLAGS Flags);
 
-#define FLT_REGISTRATION_VERSION 0x00020002
+#define FLT_REGISTRATION_VERSION 0x0203
 
+typedef ULONG FLT_REGISTRATION_FLAGS;
+
+/* Field count mirrors the real WDK struct EXACTLY (16 fields) so that
+   excess-initializer errors (C2078) are caught by the local check. */
 typedef struct _FLT_REGISTRATION {
     USHORT Size;
     USHORT Version;
-    ULONG Flags;
+    FLT_REGISTRATION_FLAGS Flags;
     const void* ContextRegistration;
     const void* OperationRegistration;
-    USHORT NumberOfGenericCallbacks;
-    const void* GenericOperationCallbacks;
     PFLT_FILTER_UNLOAD_CALLBACK FilterUnloadCallback;
     const void* InstanceSetup;
     const void* InstanceQueryTeardown;
@@ -115,14 +117,7 @@ typedef struct _FLT_REGISTRATION {
     const void* NormalizeContextCleanup;
     const void* TransactionNotification;
     const void* NormalizeNameComponentEx;
-    const void* SectionConflictNotification;
-    const void* NotifyCallback;
-    const void* OperationProcessNotify;
-    const void* ProcessNotify;
-    const void* IoQueueNotify;
-    const void* VolumeNotify;
-    const void* IoRingBufferNotify;
-    const void* IoRingBufferErrorNotify;
+    const void* SectionNotification;
 } FLT_REGISTRATION;
 
 /* ---- Port callbacks / flags ------------------------------------ */
