@@ -51,9 +51,12 @@ jobs:
         uses: microsoft/setup-msbuild@v2
 
       - name: Build driver (x64 Release)
+        # NOTE: OutDir/IntDir use forward slashes and NO quotes — a path
+        # ending in backslash-before-quote would be mangled by cmd/MSBuild
+        # (\\" escapes the quote). Workspace paths never contain spaces.
         shell: cmd
         run: |
-          msbuild driver\EchoVaultFilter.vcxproj /p:Configuration=Release /p:Platform=x64 /p:OutDir="%GITHUB_WORKSPACE%\driver\bin\x64\Release\" /p:IntDir="%GITHUB_WORKSPACE%\driver\obj\x64\Release\" /m
+          msbuild driver\EchoVaultFilter.vcxproj /p:Configuration=Release /p:Platform=x64 /p:OutDir=%GITHUB_WORKSPACE%/driver/bin/x64/Release/ /p:IntDir=%GITHUB_WORKSPACE%/driver/obj/x64/Release/ /m
 
       - name: Verify the gate logic on a fresh machine (best-effort)
         # The deny/allow/exclusion logic test (shared/evtable.h) compiled
