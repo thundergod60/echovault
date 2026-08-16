@@ -70,8 +70,15 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\shared\evfilter.h" />
-    <Inf Include="EchoVaultFilter.inf" />
   </ItemGroup>
+  <!--
+    NOTE: no <Inf> item here on purpose. The INF is already stamped
+    (fixed DriverVer in EchoVaultFilter.inf) and the catalog is only
+    needed for signed installs (attestation signing regenerates it).
+    Including an Inf item would run StampInf/Inf2Cat, whose tools
+    (stampinf.exe etc.) live in the machine-wide WDK bin folder that
+    the NuGet-only CI build does not install.
+  -->
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />
 </Project>
