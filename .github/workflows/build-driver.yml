@@ -1,0 +1,73 @@
+#------------------------------------------------------------
+# Build the EchoVault minifilter in the cloud.
+#
+# Why: building a kernel driver normally needs Visual Studio +
+# WDK (~8 GB) — too heavy for this laptop. This workflow does
+# the build on a free GitHub Actions Windows runner and returns
+# the finished EchoVaultFilter.sys as a downloadable artifact
+# (a few dozen KB). Your machine downloads only the result.
+#
+# How to use:
+#   1. Push this project to a GitHub repository (the repo can be
+#      private or public; Actions is free for both).
+#   2. Open the repo's "Actions" tab -> "Build EchoVault driver"
+#      -> "Run workflow" (or just push a change to driver/).
+#   3. When it finishes, open the run, scroll to "Artifacts",
+#      download "EchoVaultFilter-sys".
+#------------------------------------------------------------
+
+name: Build EchoVault driver
+
+on:
+  workflow_dispatch:            # manual "Run workflow" button
+  push:
+    paths:
+      - 'driver/**'
+      - 'shared/**'
+      - '.github/workflows/build-driver.yml'
+
+jobs:
+  build-driver:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Visual Studio Build Tools (C++ workload)
+        shell: pwsh
+        run: |
+          winget install Microsoft.VisualStudio.2022.BuildTools --silent `
+            --accept-package-agreements --accept-source-agreements `
+            --override "--quiet --wait --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+
+      - name: Install Windows Driver Kit
+        shell: pwsh
+        run: |
+          winget install Microsoft.WindowsDriverKit.10 --silent `
+            --accept-package-agreements --accept-source-agreements
+
+      - name: Build driver (x64 Release)
+        shell: cmd
+        run: |
+          call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+          msbuild driver\EchoVaultFilter.vcxproj /p:Configuration=Release /p:Platform=x64 /m
+
+      - name: Verify the gate logic on a fresh machine (best-effort)
+        # The deny/allow/exclusion logic test (shared/evtable.h) compiled
+        # and run here, so the first run proves the decisions are sound
+        # even before any kernel is involved. Best-effort: never blocks
+        # the artifact.
+        shell: cmd
+        continue-on-error: true
+        run: |
+          call "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+          cl /nologo /O2 /W3 driver\test-evtable.c /Fe:test-evtable.exe /link user32.lib
+          test-evtable.exe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: EchoVaultFilter-sys
+          path: |
+            driver/x64/Release/EchoVaultFilter.sys
+            driver/EchoVaultFilter.inf

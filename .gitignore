@@ -1,0 +1,15 @@
+# Binaries / build output
+*.exe
+*.o
+*.obj
+*.sys
+*.pdb
+*.ilk
+output/
+
+# Tool metadata
+.freebuff/
+
+# OS junk
+Thumbs.db
+Desktop.ini

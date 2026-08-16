@@ -1,0 +1,36 @@
+;------------------------------------------------------------
+; EchoVaultFilter.inf — registers the filter as a demand-start
+; kernel service. Development-only convenience; the driver can
+; also be loaded with:  fltmc load EchoVaultFilter
+;------------------------------------------------------------
+
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = "ActivityMonitor"
+ClassGuid   = {b86dff51-a31e-4bac-b3cf-e8c898bd5d53}
+Provider    = %ProviderName%
+DriverVer   = 08/15/2026,1.0.0.0
+CatalogFile = EchoVaultFilter.cat
+
+[DestinationDirs]
+DefaultDestDir = 12
+
+[DefaultInstall.NTamd64]
+CopyFiles = DriverFiles.NTamd64
+
+[DefaultInstall.NTamd64.Services]
+AddService = EchoVaultFilter,, EchoVaultFilter_Service_Inst
+
+[DriverFiles.NTamd64]
+EchoVaultFilter.sys = 12, \System32\drivers
+
+[EchoVaultFilter_Service_Inst]
+DisplayName   = %ServiceName%
+ServiceType   = 2        ; SERVICE_FILE_SYSTEM_DRIVER
+StartType     = 3        ; SERVICE_DEMAND_START (fltmc load to start)
+ErrorControl  = 1        ; SERVICE_ERROR_NORMAL (boot continues on failure)
+ServiceBinary = %12%\System32\drivers\EchoVaultFilter.sys
+
+[Strings]
+ProviderName = "EchoVault"
+ServiceName  = "EchoVaultFilter"
