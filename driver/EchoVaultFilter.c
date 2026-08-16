@@ -137,7 +137,7 @@ static VOID EvNotifyWorker(_In_ PVOID Context)
     KIRQL irql;
     ExAcquireSpinLock(&gPortLock, &irql);
     client = gClientPort;
-    ExReleaseSpinLock(&gPortLock, &irql);
+    ExReleaseSpinLock(&gPortLock, irql);
 
     if (client)
     {
@@ -185,7 +185,7 @@ static VOID EvQueueDenyNotification(const UNICODE_STRING* name, const WCHAR* app
 
     if (throttled || gClientPort == NULL)
     {
-        ExReleaseSpinLock(&gPortLock, &irql);
+        ExReleaseSpinLock(&gPortLock, irql);
         return;
     }
 
@@ -193,7 +193,7 @@ static VOID EvQueueDenyNotification(const UNICODE_STRING* name, const WCHAR* app
         POOL_FLAG_NON_PAGED, sizeof(EV_NOTIFY_CONTEXT), EV_NOTIFY_TAG);
     if (!c)
     {
-        ExReleaseSpinLock(&gPortLock, &irql);
+        ExReleaseSpinLock(&gPortLock, irql);
         return;
     }
 
@@ -205,7 +205,7 @@ static VOID EvQueueDenyNotification(const UNICODE_STRING* name, const WCHAR* app
 
     gLastNotifyTick = tick;
     RtlCopyMemory(gLastNotifyPath, c->Path, (chars + 1) * sizeof(WCHAR));
-    ExReleaseSpinLock(&gPortLock, &irql);
+    ExReleaseSpinLock(&gPortLock, irql);
 
     ExInitializeWorkItem(&c->Wq, EvNotifyWorker, c);
     ExQueueWorkItem(&c->Wq, DelayedWorkQueue);
@@ -230,12 +230,12 @@ static NTSTATUS EvConnectNotify(
     {
         PFLT_PORT old = gClientPort;
         gClientPort = NULL;
-        ExReleaseSpinLock(&gPortLock, &irql);
+        ExReleaseSpinLock(&gPortLock, irql);
         FltCloseClientPort(gFilter, &old);
         ExAcquireSpinLock(&gPortLock, &irql);
     }
     gClientPort = ClientPort;
-    ExReleaseSpinLock(&gPortLock, &irql);
+    ExReleaseSpinLock(&gPortLock, irql);
 
     *ConnectionPortCookie = (PVOID)ClientPort;
     return STATUS_SUCCESS;
@@ -249,7 +249,7 @@ static VOID EvDisconnectNotify(_In_opt_ PVOID ConnectionCookie)
     ExAcquireSpinLock(&gPortLock, &irql);
     gClientPort = NULL;
     gLastNotifyTick = 0;
-    ExReleaseSpinLock(&gPortLock, &irql);
+    ExReleaseSpinLock(&gPortLock, irql);
 }
 
 static NTSTATUS EvMessageNotify(
@@ -401,7 +401,7 @@ static NTSTATUS EvFilterUnload(_In_ FLT_FILTER_UNLOAD_FLAGS Flags)
     PFLT_PORT client = gClientPort;
     gClientPort = NULL;
     gLastNotifyTick = 0;
-    ExReleaseSpinLock(&gPortLock, &irql);
+    ExReleaseSpinLock(&gPortLock, irql);
     if (client)
         FltCloseClientPort(gFilter, &client);
 
