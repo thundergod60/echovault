@@ -43,7 +43,9 @@ jobs:
       - name: Install Windows Driver Kit
         shell: pwsh
         run: |
-          winget install Microsoft.WindowsDriverKit.10 --silent `
+          # The WDK's winget ID is versioned (Microsoft.WindowsWDK.10.0.<build>);
+          # "Microsoft.WindowsDriverKit.10" does not exist.
+          winget install Microsoft.WindowsWDK.10.0.26100 --silent `
             --accept-package-agreements --accept-source-agreements
 
       - name: Build driver (x64 Release)
