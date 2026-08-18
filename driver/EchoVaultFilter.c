@@ -292,27 +292,27 @@ static NTSTATUS EvBuildPortSecurityDescriptor(PSECURITY_DESCRIPTOR* OutSd)
     NTSTATUS status = STATUS_UNSUCCESSFUL;
     PSECURITY_DESCRIPTOR sd = NULL;
     PACL acl = NULL;
-    PSID authUsers = NULL;
-    PSID admins = NULL;
     SID_IDENTIFIER_AUTHORITY ntAuth = SECURITY_NT_AUTHORITY;
+
+    // SIDs are built on the stack with the kernel Rtl* APIs (the
+    // user-mode RtlAllocateAndInitializeSid/RtlFreeSid are ntdll exports
+    // and do not exist in ntoskrnl.lib). 40 bytes fits S-1-5-11 and
+    // S-1-5-32-544 (16 bytes each, no subauthority nesting).
+    UCHAR authUsersBuf[40];
+    UCHAR adminsBuf[40];
+    PSID authUsers = (PSID)authUsersBuf;
+    PSID admins = (PSID)adminsBuf;
 
     // S-1-5-11: Authenticated Users — the logged-on user's processes
     // (EchoVault.exe, the guard, the watcher).
-    if (!RtlAllocateAndInitializeSid(&ntAuth, 1, SECURITY_AUTHENTICATED_USER_RID,
-            0, 0, 0, 0, 0, 0, 0, &authUsers))
-    {
-        status = STATUS_NO_MEMORY;
-        goto done;
-    }
+    RtlInitializeSid(authUsers, &ntAuth, 1);
+    *RtlSubAuthoritySid(authUsers, 0) = SECURITY_AUTHENTICATED_USER_RID;
 
     // S-1-5-32-544: BUILTIN\Administrators — keeps elevated tools like
     // filterctl working.
-    if (!RtlAllocateAndInitializeSid(&ntAuth, 2, SECURITY_BUILTIN_DOMAIN_RID,
-            DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &admins))
-    {
-        status = STATUS_NO_MEMORY;
-        goto done;
-    }
+    RtlInitializeSid(admins, &ntAuth, 2);
+    *RtlSubAuthoritySid(admins, 0) = SECURITY_BUILTIN_DOMAIN_RID;
+    *RtlSubAuthoritySid(admins, 1) = DOMAIN_ALIAS_RID_ADMINS;
 
     ULONG aclSize = sizeof(ACL)
         + (sizeof(ACCESS_ALLOWED_ACE) - sizeof(ULONG)) + RtlLengthSid(authUsers)
@@ -342,8 +342,6 @@ static NTSTATUS EvBuildPortSecurityDescriptor(PSECURITY_DESCRIPTOR* OutSd)
     sd = NULL;      // ownership transferred to the caller
 
  done:
-    if (authUsers) RtlFreeSid(authUsers);
-    if (admins)    RtlFreeSid(admins);
     if (acl)       ExFreePoolWithTag(acl, EV_SD_TAG);
     if (sd)        ExFreePoolWithTag(sd, EV_SD_TAG);
     return status;

@@ -21,6 +21,7 @@ typedef void VOID;
 typedef void* PVOID;
 typedef const void* PCVOID;
 typedef char* PCHAR;
+typedef unsigned char* PUCHAR;
 typedef const char* PCSZ;
 typedef WCHAR* PWSTR;
 typedef const WCHAR* PCWSTR;
@@ -170,8 +171,9 @@ typedef struct _ACL { UCHAR AclRevision; UCHAR Sbz1; USHORT AclSize; USHORT AceC
 #define SECURITY_BUILTIN_DOMAIN_RID    0x00000020L
 #define DOMAIN_ALIAS_RID_ADMINS        0x00000220L
 
-BOOLEAN RtlAllocateAndInitializeSid(PSID_IDENTIFIER_AUTHORITY IdentifierAuthority, UCHAR SubAuthorityCount, ULONG SubAuthority0, ULONG SubAuthority1, ULONG SubAuthority2, ULONG SubAuthority3, ULONG SubAuthority4, ULONG SubAuthority5, ULONG SubAuthority6, ULONG SubAuthority7, PSID* Sid);
-NTSTATUS RtlFreeSid(PSID Sid);
+void RtlInitializeSid(PSID Sid, PSID_IDENTIFIER_AUTHORITY IdentifierAuthority, UCHAR SubAuthorityCount);
+PULONG RtlSubAuthoritySid(PSID Sid, ULONG SubAuthority);
+PUCHAR RtlSubAuthorityCountSid(PSID Sid);
 ULONG RtlLengthSid(PSID Sid);
 NTSTATUS RtlCreateSecurityDescriptor(PSECURITY_DESCRIPTOR SecurityDescriptor, UCHAR Revision);
 NTSTATUS RtlCreateAcl(PACL Acl, ULONG AclLength, ULONG AclRevision);
