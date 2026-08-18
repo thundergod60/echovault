@@ -231,7 +231,9 @@ static int CmdLoad(int argc, wchar_t** wargv)
     RunCmd(L"sc delete EchoVaultFilter");
 
     wchar_t cmd[2048];
-    wsprintfW(cmd, L"sc create EchoVaultFilter type= kernel binPath= \"%s\"", destPath);
+    // start= boot: auto-load with Filter Manager at every boot, so locked
+    // files stay locked without a manual fltmc load after a reboot.
+    wsprintfW(cmd, L"sc create EchoVaultFilter type= kernel start= boot binPath= \"%s\"", destPath);
     RunCmd(cmd);
 
     // Register the altitude (the INF normally does this).
@@ -260,6 +262,11 @@ static int CmdDisable(void)
     // Unload if running (best effort — may already be unloaded).
     RunCmd(L"fltmc unload EchoVaultFilter");
 
+    // The service is normally boot-start (auto-loads with Filter Manager).
+    // Demote it to demand-start so nothing pulls the driver back in on the
+    // next boot — that is what "keep unloaded across reboots" means now.
+    RunCmd(L"sc config EchoVaultFilter start= demand");
+
     FILETIME ft;
     GetSystemTimeAsFileTime(&ft);
     EvFsSetUnloaded(((ULONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime);
@@ -273,8 +280,12 @@ static int CmdDisable(void)
 
 static int CmdEnable(void)
 {
+    // Restore boot-start so the driver auto-loads again on the next boot.
+    RunCmd(L"sc config EchoVaultFilter start= boot");
+
     EvFsSetDisabled(0);
-    wprintf(L"OK: off-switch cleared. The driver can now be started with:\n"
+    wprintf(L"OK: off-switch cleared. The driver will auto-load on the next\n"
+            L"boot; to start it right now:\n"
             L"    filterctl load   (as administrator)\n");
     return 0;
 }

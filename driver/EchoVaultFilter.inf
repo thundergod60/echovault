@@ -27,7 +27,7 @@ EchoVaultFilter.sys = 12
 [EchoVaultFilter_Service_Inst]
 DisplayName   = %ServiceName%
 ServiceType   = 2        ; SERVICE_FILE_SYSTEM_DRIVER
-StartType     = 3        ; SERVICE_DEMAND_START (fltmc load to start)
+StartType     = 0        ; SERVICE_BOOT_START (auto-loads with Filter Manager)
 ErrorControl  = 1        ; SERVICE_ERROR_NORMAL (boot continues on failure)
 ServiceBinary = %12%\EchoVaultFilter.sys
 AddReg        = EchoVaultFilter_AddReg
