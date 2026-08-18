@@ -117,8 +117,8 @@ static PFLT_PORT  gClients[EV_MAX_CLIENTS];
 // Build tag, embedded in the .sys so CI artifacts can be told apart
 // beyond doubt. Any .sys built before this tag does NOT contain the
 // string. Verify a downloaded driver with:
-//     findstr /c:"EVBUILD-MULTICLIENT-16" EchoVaultFilter.sys
-const char EvBuildTag[] = "EVBUILD-MULTICLIENT-16";
+//     findstr /c:"EVBUILD-PORTFIX-20260818" EchoVaultFilter.sys
+const char EvBuildTag[] = "EVBUILD-PORTFIX-20260818";
 
 // 2-second throttle: don't spam the guard with duplicate denies of
 // the same path (Explorer can retry opens rapidly).
@@ -581,8 +581,14 @@ DriverEntry(
 
     UNICODE_STRING portName = RTL_CONSTANT_STRING(EVFILTER_PORT_NAME);
     OBJECT_ATTRIBUTES oa;
+    // CRITICAL: the security descriptor MUST be attached to the object
+    // attributes. FltCreateCommunicationPort has no SD parameter — the
+    // ACL travels via InitializeObjectAttributes. With a NULL descriptor
+    // the port grants access only to SYSTEM, so EVERY user-mode client
+    // (guard, app, filterctl — even an elevated admin) is rejected with
+    // STATUS_ACCESS_DENIED on FilterConnectCommunicationPort.
     InitializeObjectAttributes(&oa, &portName,
-        OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+        OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, sd);
 
     status = FltCreateCommunicationPort(gFilter, &gServerPort, &oa, NULL,
         EvConnectNotify, EvDisconnectNotify, EvMessageNotify, EV_MAX_CLIENTS);
