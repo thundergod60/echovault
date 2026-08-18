@@ -9,7 +9,7 @@ Signature   = "$WINDOWS NT$"
 Class       = "ActivityMonitor"
 ClassGuid   = {b86dff51-a31e-4bac-b3cf-e8c898bd5d53}
 Provider    = %ProviderName%
-DriverVer   = 08/15/2026,1.0.0.0
+DriverVer   = 08/18/2026,1.0.1.0
 CatalogFile = EchoVaultFilter.cat
 
 [DestinationDirs]

@@ -136,6 +136,7 @@ typedef LARGE_INTEGER* PLARGE_INTEGER;
 void  ExAcquireSpinLock(KSPIN_LOCK* Lock, KIRQL* OldIrql);
 void  ExReleaseSpinLock(KSPIN_LOCK* Lock, KIRQL OldIrql);
 ULONG RtlRandomEx(PULONG Seed);
+void  DbgPrint(const char* Format, ...);
 
 VOID RtlInitAnsiString(PANSI_STRING Dest, PCSZ Source);
 VOID RtlInitUnicodeString(PUNICODE_STRING Dest, PCWSTR Source);

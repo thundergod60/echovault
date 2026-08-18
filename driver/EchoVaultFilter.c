@@ -114,6 +114,12 @@ static KSPIN_LOCK gPortLock;
 #define EV_MAX_CLIENTS 16
 static PFLT_PORT  gClients[EV_MAX_CLIENTS];
 
+// Build tag, embedded in the .sys so CI artifacts can be told apart
+// beyond doubt. Any .sys built before this tag does NOT contain the
+// string. Verify a downloaded driver with:
+//     findstr /c:"EVBUILD-MULTICLIENT-16" EchoVaultFilter.sys
+const char EvBuildTag[] = "EVBUILD-MULTICLIENT-16";
+
 // 2-second throttle: don't spam the guard with duplicate denies of
 // the same path (Explorer can retry opens rapidly).
 #define EV_NOTIFY_THROTTLE_TICKS 200   // ~2s at 10ms tick
@@ -599,6 +605,9 @@ DriverEntry(
         gFilter = NULL;
         return status;
     }
+
+    // Reference the build tag so the linker keeps it in the image.
+    DbgPrint("EchoVaultFilter %s loaded\n", EvBuildTag);
 
     return STATUS_SUCCESS;
 }
