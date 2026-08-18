@@ -93,6 +93,7 @@ typedef struct _FAST_MUTEX { char data[16]; } FAST_MUTEX, *PFAST_MUTEX;
 #define STATUS_INVALID_PARAMETER         ((NTSTATUS)0xC000000DL)
 #define STATUS_NOT_FOUND                 ((NTSTATUS)0xC0000225L)
 #define STATUS_INSUFFICIENT_RESOURCES    ((NTSTATUS)0xC000009AL)
+#define STATUS_NO_MEMORY                 ((NTSTATUS)0xC0000017L)
 #define STATUS_BUFFER_TOO_SMALL           ((NTSTATUS)0xC0000023L)
 
 #define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
@@ -150,6 +151,33 @@ NTSTATUS ZwOpenSymbolicLinkObject(PHANDLE LinkHandle, ULONG DesiredAccess, POBJE
 NTSTATUS ZwQuerySymbolicLinkObject(HANDLE LinkHandle, PUNICODE_STRING LinkTarget, PULONG ReturnedLength);
 NTSTATUS ZwClose(HANDLE Handle);
 #define GENERIC_READ 0x80000000L
+
+/* ---- Security descriptor stubs (custom port ACL) ---------------- */
+typedef BOOLEAN* PBOOLEAN;
+typedef void* PSID;
+typedef struct _SID_IDENTIFIER_AUTHORITY { UCHAR Value[6]; } SID_IDENTIFIER_AUTHORITY;
+typedef SID_IDENTIFIER_AUTHORITY* PSID_IDENTIFIER_AUTHORITY;
+typedef struct _ACE_HEADER { UCHAR AceType; UCHAR AceFlags; USHORT AceSize; } ACE_HEADER;
+typedef ULONG ACCESS_MASK;
+typedef struct _ACCESS_ALLOWED_ACE { ACE_HEADER Header; ACCESS_MASK Mask; ULONG SidStart; } ACCESS_ALLOWED_ACE;
+typedef struct _ACL { UCHAR AclRevision; UCHAR Sbz1; USHORT AclSize; USHORT AceCount; USHORT Sbz2; } ACL, *PACL;
+
+#define SECURITY_DESCRIPTOR_MIN_LENGTH 20
+#define SECURITY_DESCRIPTOR_REVISION   1
+#define ACL_REVISION                   2
+#define SECURITY_NT_AUTHORITY          {0,0,0,0,0,5}
+#define SECURITY_AUTHENTICATED_USER_RID 0x0000000BL
+#define SECURITY_BUILTIN_DOMAIN_RID    0x00000020L
+#define DOMAIN_ALIAS_RID_ADMINS        0x00000220L
+
+BOOLEAN RtlAllocateAndInitializeSid(PSID_IDENTIFIER_AUTHORITY IdentifierAuthority, UCHAR SubAuthorityCount, ULONG SubAuthority0, ULONG SubAuthority1, ULONG SubAuthority2, ULONG SubAuthority3, ULONG SubAuthority4, ULONG SubAuthority5, ULONG SubAuthority6, ULONG SubAuthority7, PSID* Sid);
+NTSTATUS RtlFreeSid(PSID Sid);
+ULONG RtlLengthSid(PSID Sid);
+NTSTATUS RtlCreateSecurityDescriptor(PSECURITY_DESCRIPTOR SecurityDescriptor, UCHAR Revision);
+NTSTATUS RtlCreateAcl(PACL Acl, ULONG AclLength, ULONG AclRevision);
+NTSTATUS RtlAddAccessAllowedAce(PACL Acl, ULONG AceRevision, ACCESS_MASK AccessMask, PSID Sid);
+NTSTATUS RtlSetDaclSecurityDescriptor(PSECURITY_DESCRIPTOR SecurityDescriptor, BOOLEAN DaclPresent, PACL Dacl, BOOLEAN DaclDefaulted);
+NTSTATUS RtlGetDaclSecurityDescriptor(PSECURITY_DESCRIPTOR SecurityDescriptor, PBOOLEAN DaclPresent, PACL* Dacl, PBOOLEAN DaclDefaulted);
 
 typedef enum _WORK_QUEUE_TYPE {
     CriticalWorkQueue, DelayedWorkQueue, HyperCriticalWorkQueue,

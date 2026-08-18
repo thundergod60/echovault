@@ -117,8 +117,8 @@ static PFLT_PORT  gClients[EV_MAX_CLIENTS];
 // Build tag, embedded in the .sys so CI artifacts can be told apart
 // beyond doubt. Any .sys built before this tag does NOT contain the
 // string. Verify a downloaded driver with:
-//     findstr /c:"EVBUILD-PORTFIX-20260818" EchoVaultFilter.sys
-const char EvBuildTag[] = "EVBUILD-PORTFIX-20260818";
+//     findstr /c:"EVBUILD-PORTUSERS-20260818" EchoVaultFilter.sys
+const char EvBuildTag[] = "EVBUILD-PORTUSERS-20260818";
 
 // 2-second throttle: don't spam the guard with duplicate denies of
 // the same path (Explorer can retry opens rapidly).
@@ -274,6 +274,96 @@ static VOID EvQueueDenyNotification(const UNICODE_STRING* name, const WCHAR* app
 // translated to device form. The logic lives in evdevpath.c so it can
 // be unit-tested in user mode; the same code runs in the kernel.
 #include "evdevpath.c"
+
+// ---- Communication port security ------------------------------
+// FltBuildDefaultSecurityDescriptor builds a DACL that grants access
+// only to SYSTEM and Administrators. EchoVault.exe, the guard, and the
+// watcher all run as the normal (non-elevated) logged-on user, so with
+// that descriptor every one of their port connections is rejected with
+// STATUS_ACCESS_DENIED and every path registration silently fails —
+// encrypted files and folders would never actually be gated. Build a
+// custom descriptor that ALSO grants Authenticated Users, so the app's
+// own processes can connect while the gate still denies every other
+// opener (the file opens themselves are gated separately, per-path).
+#define EV_SD_TAG 'tfvE'
+
+static NTSTATUS EvBuildPortSecurityDescriptor(PSECURITY_DESCRIPTOR* OutSd)
+{
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+    PSECURITY_DESCRIPTOR sd = NULL;
+    PACL acl = NULL;
+    PSID authUsers = NULL;
+    PSID admins = NULL;
+    SID_IDENTIFIER_AUTHORITY ntAuth = SECURITY_NT_AUTHORITY;
+
+    // S-1-5-11: Authenticated Users — the logged-on user's processes
+    // (EchoVault.exe, the guard, the watcher).
+    if (!RtlAllocateAndInitializeSid(&ntAuth, 1, SECURITY_AUTHENTICATED_USER_RID,
+            0, 0, 0, 0, 0, 0, 0, &authUsers))
+    {
+        status = STATUS_NO_MEMORY;
+        goto done;
+    }
+
+    // S-1-5-32-544: BUILTIN\Administrators — keeps elevated tools like
+    // filterctl working.
+    if (!RtlAllocateAndInitializeSid(&ntAuth, 2, SECURITY_BUILTIN_DOMAIN_RID,
+            DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &admins))
+    {
+        status = STATUS_NO_MEMORY;
+        goto done;
+    }
+
+    ULONG aclSize = sizeof(ACL)
+        + (sizeof(ACCESS_ALLOWED_ACE) - sizeof(ULONG)) + RtlLengthSid(authUsers)
+        + (sizeof(ACCESS_ALLOWED_ACE) - sizeof(ULONG)) + RtlLengthSid(admins);
+
+    acl = (PACL)ExAllocatePool2(POOL_FLAG_NON_PAGED, aclSize, EV_SD_TAG);
+    sd = (PSECURITY_DESCRIPTOR)ExAllocatePool2(POOL_FLAG_NON_PAGED,
+        SECURITY_DESCRIPTOR_MIN_LENGTH, EV_SD_TAG);
+    if (!acl || !sd)
+    {
+        status = STATUS_NO_MEMORY;
+        goto done;
+    }
+
+    status = RtlCreateSecurityDescriptor(sd, SECURITY_DESCRIPTOR_REVISION);
+    if (!NT_SUCCESS(status)) goto done;
+    status = RtlCreateAcl(acl, aclSize, ACL_REVISION);
+    if (!NT_SUCCESS(status)) goto done;
+    status = RtlAddAccessAllowedAce(acl, ACL_REVISION, FLT_PORT_ALL_ACCESS, authUsers);
+    if (!NT_SUCCESS(status)) goto done;
+    status = RtlAddAccessAllowedAce(acl, ACL_REVISION, FLT_PORT_ALL_ACCESS, admins);
+    if (!NT_SUCCESS(status)) goto done;
+    status = RtlSetDaclSecurityDescriptor(sd, TRUE, acl, FALSE);
+    if (!NT_SUCCESS(status)) goto done;
+
+    *OutSd = sd;
+    sd = NULL;      // ownership transferred to the caller
+
+ done:
+    if (authUsers) RtlFreeSid(authUsers);
+    if (admins)    RtlFreeSid(admins);
+    if (acl)       ExFreePoolWithTag(acl, EV_SD_TAG);
+    if (sd)        ExFreePoolWithTag(sd, EV_SD_TAG);
+    return status;
+}
+
+static VOID EvFreePortSecurityDescriptor(PSECURITY_DESCRIPTOR sd)
+{
+    if (!sd) return;
+
+    // The DACL is a separately allocated block referenced by the SD.
+    PACL dacl = NULL;
+    BOOLEAN daclPresent = FALSE;
+    BOOLEAN daclDefaulted = FALSE;
+    if (NT_SUCCESS(RtlGetDaclSecurityDescriptor(sd, &daclPresent, &dacl, &daclDefaulted))
+        && daclPresent && dacl)
+    {
+        ExFreePoolWithTag(dacl, EV_SD_TAG);
+    }
+    ExFreePoolWithTag(sd, EV_SD_TAG);
+}
 
 // ---- Communication port ---------------------------------------
 
@@ -571,7 +661,7 @@ DriverEntry(
         return status;
 
     PSECURITY_DESCRIPTOR sd = NULL;
-    status = FltBuildDefaultSecurityDescriptor(&sd, FLT_PORT_ALL_ACCESS);
+    status = EvBuildPortSecurityDescriptor(&sd);
     if (!NT_SUCCESS(status))
     {
         FltUnregisterFilter(gFilter);
@@ -586,14 +676,17 @@ DriverEntry(
     // ACL travels via InitializeObjectAttributes. With a NULL descriptor
     // the port grants access only to SYSTEM, so EVERY user-mode client
     // (guard, app, filterctl — even an elevated admin) is rejected with
-    // STATUS_ACCESS_DENIED on FilterConnectCommunicationPort.
+    // STATUS_ACCESS_DENIED on FilterConnectCommunicationPort. And with
+    // FltBuildDefaultSecurityDescriptor it grants access only to SYSTEM
+    // and Administrators, which silently starves the non-elevated app
+    // (see EvBuildPortSecurityDescriptor).
     InitializeObjectAttributes(&oa, &portName,
         OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, sd);
 
     status = FltCreateCommunicationPort(gFilter, &gServerPort, &oa, NULL,
         EvConnectNotify, EvDisconnectNotify, EvMessageNotify, EV_MAX_CLIENTS);
 
-    FltFreeSecurityDescriptor(sd);
+    EvFreePortSecurityDescriptor(sd);
 
     if (!NT_SUCCESS(status))
     {
