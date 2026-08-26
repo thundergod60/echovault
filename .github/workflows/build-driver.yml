@@ -69,6 +69,32 @@ jobs:
             /m
           if ($LASTEXITCODE -ne 0) { throw "MSBuild failed with exit code $LASTEXITCODE." }
 
+      - name: Validate INF and imported APIs
+        shell: pwsh
+        run: |
+          $wdkRoot = Join-Path $env:GITHUB_WORKSPACE 'packages\Microsoft.Windows.WDK.x64.10.0.28000.2526\c'
+          $infVerif = Join-Path $wdkRoot 'tools\10.0.28000.0\x64\infverif.exe'
+          $apiDir = Join-Path $wdkRoot 'bin\10.0.28000.0\x64'
+          $apiValidator = Join-Path $apiDir 'apivalidator.exe'
+          $apiSurface = Join-Path $wdkRoot 'build\10.0.28000.0\universalDDIs\x64\UniversalDDIs.xml'
+
+          foreach ($required in @($infVerif, $apiValidator, $apiSurface)) {
+            if (-not (Test-Path -LiteralPath $required)) { throw "Required WDK validator is missing: $required" }
+          }
+
+          & $infVerif /w /v driver\EchoVaultFilter.inf
+          if ($LASTEXITCODE -ne 0) { throw "InfVerif failed with exit code $LASTEXITCODE." }
+
+          $validationDir = Join-Path $env:RUNNER_TEMP 'echovault-driver-package'
+          New-Item -ItemType Directory -Path $validationDir -Force | Out-Null
+          Copy-Item -LiteralPath 'driver\bin\x64\Release\EchoVaultFilter.sys' -Destination $validationDir
+          Copy-Item -LiteralPath 'driver\EchoVaultFilter.inf' -Destination $validationDir
+          & $apiValidator `
+            "-DriverPackagePath:$validationDir" `
+            "-SupportedApiXmlFiles:$apiSurface" `
+            "-ApiExtractorExePath:$apiDir"
+          if ($LASTEXITCODE -ne 0) { throw "ApiValidator failed with exit code $LASTEXITCODE." }
+
       - name: Verify and describe artifact
         shell: pwsh
         run: |

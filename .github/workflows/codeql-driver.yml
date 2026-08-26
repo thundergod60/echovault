@@ -1,0 +1,82 @@
+name: Analyze EchoVault driver
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'driver/**'
+      - 'shared/**'
+      - 'packages.config'
+      - 'Directory.Build.props'
+      - '.github/workflows/codeql-driver.yml'
+
+permissions:
+  actions: read
+  contents: read
+  packages: read
+  security-events: write
+
+concurrency:
+  group: driver-codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  codeql:
+    name: Microsoft Windows-driver CodeQL
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Run source safety checks
+        shell: pwsh
+        run: ./driver/test-driver-safety.ps1
+
+      - name: Set up NuGet
+        uses: NuGet/setup-nuget@v2
+
+      - name: Restore WDK and SDK packages
+        shell: pwsh
+        run: nuget restore packages.config -PackagesDirectory packages -NonInteractive
+
+      - name: Add MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Initialize CodeQL with Microsoft driver queries
+        uses: github/codeql-action/init@v4
+        with:
+          languages: c-cpp
+          build-mode: manual
+          packs: microsoft/windows-drivers@1.10.0:windows-driver-suites/recommended.qls
+
+      - name: Build x64 Release driver for CodeQL
+        shell: pwsh
+        run: |
+          $outDir = "$env:GITHUB_WORKSPACE/driver/bin/codeql/x64/Release"
+          $intDir = "$env:GITHUB_WORKSPACE/driver/obj/codeql/x64/Release"
+          msbuild driver\EchoVaultFilter.vcxproj `
+            /t:Rebuild `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            "/p:OutDir=$outDir/" `
+            "/p:IntDir=$intDir/" `
+            /m
+          if ($LASTEXITCODE -ne 0) { throw "CodeQL build failed with exit code $LASTEXITCODE." }
+
+      - name: Analyze with Microsoft Windows-driver rules
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: /language:c-cpp/windows-driver
+          output: codeql-results
+
+      - name: Upload readable CodeQL results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: EchoVault-driver-CodeQL-SARIF
+          if-no-files-found: warn
+          retention-days: 14
+          path: codeql-results
