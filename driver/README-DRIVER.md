@@ -176,16 +176,18 @@ Any kernel code can bugcheck — no design changes that. What this project
 adds is a **survivability layer** so a crash is never permanent, never
 silent, and never repeated by accident:
 
-1. **The driver is demand-start and never auto-loads.** After any reboot —
-   clean or crashed — the driver is simply not running. The machine always
-   boots; your screen reader always comes back. A crash's cost is one
-   reboot, and only while the driver was explicitly loaded.
-2. **The driver never touches file contents.** There is no data-loss path:
-   a crash interrupts an open, it cannot corrupt encrypted data.
-3. **The off-switch survives reboots.** `filterctl disable` unloads it and
-   writes a persistent marker; `filterctl load` refuses to start while the
-   marker is set (cleared by `filterctl enable`). One command, works even
-   with the driver absent.
+1. **The driver is demand-start and never auto-loads.** Both the INF and
+   `filterctl` enforce demand-start. After a reboot the driver stays off
+   until an administrator explicitly loads it. This removes the project's
+   previous boot-loop failure mode; it does not make untested kernel code
+   safe to run on a daily machine.
+2. **The driver never intentionally touches file contents.** Its callbacks
+   only make access decisions. A kernel bug can still corrupt memory or
+   destabilize filesystem activity, so VM testing remains mandatory.
+3. **The off-switch survives reboots.** `filterctl disable` writes the
+   marker and demotes the service to demand-start *before* attempting an
+   unload. It records a clean unload only after the service is verified
+   stopped. `filterctl load` refuses while the marker is set.
 4. **Crashes are detected, not guessed.** `filterctl load` records when it
    loads the driver and when it is cleanly unloaded. `filterctl status`
    checks Windows' own Event Log (Event 6008 = unexpected shutdown) and, if
@@ -193,6 +195,14 @@ silent, and never repeated by accident:
    cleanly unloaded, prints a clear WARNING and `filterctl load` **refuses**
    to restart it unless you pass `--force`. The driver stays off after a
    crash until you explicitly choose to reload it.
+5. **Notifications cannot strand system workers.** Only the guard connection
+   receives deny notifications, each send has a 250 ms deadline, and unload
+   uses kernel rundown protection to wait for every queued worker before the
+   driver image is released. Disconnect callbacks close their client ports.
+6. **The user-mode ABI matches Windows.** The guard uses the 64-bit
+   `FILTER_MESSAGE_HEADER.MessageId` layout and passes an `OVERLAPPED*` (or
+   `NULL`) to `FilterGetMessage`. The previous 32-bit header/fourth-argument
+   definitions were invalid.
 
 The state lives in plain user-mode registry values
 (`HKCU\Software\EchoVault\Filter`), so all of this works even when the
@@ -255,6 +265,12 @@ protected process. The impact is bounded, though:
   EchoVault knows about; it never guesses by reading file contents.)
 - While a file is unlocked (viewing), its entry stays allow-listed, so
   anything can open it until the viewer closes and it re-locks.
+- The control port is reachable by Authenticated Users because the desktop
+  app is intentionally non-elevated. Therefore this minifilter is an
+  accidental-access/tamper guard, not a security boundary against hostile
+  code already running as the logged-on user. EVF3 encryption remains the
+  confidentiality boundary. A production hardening phase would put control
+  behind a privileged service and use per-process authorization.
 - A cancelled unlock re-denies the path (the RAII gate in the vault code).
 - Denies ALL opens of a locked path (including backup tools). This
   is a feature — encrypted content is not readable by anything — but it is

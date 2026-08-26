@@ -47,6 +47,7 @@ typedef struct _IO_STATUS_BLOCK {
 typedef struct _FLT_CALLBACK_DATA {
     IO_STATUS_BLOCK IoStatus;
     ULONG Flags;
+    KPROCESSOR_MODE RequestorMode;
 } FLT_CALLBACK_DATA;
 
 /* ---- Pre-op status / callbacks --------------------------------- */

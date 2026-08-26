@@ -167,6 +167,15 @@ end-to-end here with an injected fake event log: crash warning, load
 refusal, `--force` bypass, off-switch cycle, clean-unload branch — all
 correct.
 
+**Driver safety repair (26 August 2026):** removed the accidental boot-start
+settings from both `filterctl` and the INF; `disable` now persists the
+off-switch and demand-start setting before unload, verifies the stopped state,
+and never reports a failed unload as clean. Deny notifications now go only to
+the guard, use the correct Windows message ABI, time out after 250 ms, and are
+drained with rundown protection before unload. Kernel-originated opens fail
+open. Local builds, shared-logic tests, path tests, syntax checking, and the
+static safety checks pass; the `.sys` still requires a WDK build and VM tests.
+
 The kernel source cannot be compiled in this environment (no WDK); it must
 be built on a Windows machine with Visual Studio + WDK and tested first in a
 VM or non-critical machine, exactly as the guide describes.

@@ -87,6 +87,13 @@ typedef struct _OBJECT_ATTRIBUTES {
 typedef struct _DRIVER_OBJECT { int placeholder; } DRIVER_OBJECT, *PDRIVER_OBJECT;
 
 typedef struct _FAST_MUTEX { char data[16]; } FAST_MUTEX, *PFAST_MUTEX;
+typedef struct _EX_RUNDOWN_REF { ULONG_PTR Count; } EX_RUNDOWN_REF, *PEX_RUNDOWN_REF;
+
+typedef enum _KPROCESSOR_MODE {
+    KernelMode,
+    UserMode,
+    MaximumMode
+} KPROCESSOR_MODE;
 
 #define STATUS_SUCCESS                   ((NTSTATUS)0x00000000L)
 #define STATUS_UNSUCCESSFUL              ((NTSTATUS)0xC0000001L)
@@ -96,6 +103,7 @@ typedef struct _FAST_MUTEX { char data[16]; } FAST_MUTEX, *PFAST_MUTEX;
 #define STATUS_INSUFFICIENT_RESOURCES    ((NTSTATUS)0xC000009AL)
 #define STATUS_NO_MEMORY                 ((NTSTATUS)0xC0000017L)
 #define STATUS_BUFFER_TOO_SMALL           ((NTSTATUS)0xC0000023L)
+#define STATUS_DEVICE_BUSY               ((NTSTATUS)0xC000009EL)
 
 #define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
 #define UNREFERENCED_PARAMETER(P) ((void)(P))
@@ -127,6 +135,10 @@ void  ExFreePoolWithTag(void* P, ULONG Tag);
 void  ExInitializeFastMutex(PFAST_MUTEX M);
 void  ExAcquireFastMutex(PFAST_MUTEX M);
 void  ExReleaseFastMutex(PFAST_MUTEX M);
+void  ExInitializeRundownProtection(PEX_RUNDOWN_REF RunRef);
+BOOLEAN ExAcquireRundownProtection(PEX_RUNDOWN_REF RunRef);
+void  ExReleaseRundownProtection(PEX_RUNDOWN_REF RunRef);
+void  ExWaitForRundownProtectionRelease(PEX_RUNDOWN_REF RunRef);
 void  KeInitializeSpinLock(KSPIN_LOCK* Lock);
 typedef LARGE_INTEGER* PLARGE_INTEGER;
 /* Faithful to the real wdm.h: KeQueryTickCount is a MACRO that writes

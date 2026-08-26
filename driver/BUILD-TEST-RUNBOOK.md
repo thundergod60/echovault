@@ -154,7 +154,7 @@ root.
    `filterctl status` shows the driver as loaded. If load fails, check
    `sc query EchoVaultFilter` — usually it means test-signing is not on
    (Part A, step 4). The raw commands are `sc create EchoVaultFilter
-   type= kernel binPath= E:\driver\x64\Release\EchoVaultFilter.sys` and
+   type= filesys start= demand binPath= E:\driver\x64\Release\EchoVaultFilter.sys` and
    `fltmc load EchoVaultFilter`.
 3. Test the gate (this is the whole point):
    ```
@@ -185,6 +185,19 @@ root.
    filterctl load ...   :: refuses while the off-switch is set
    filterctl enable     :: clear it, then load again
    ```
+   After loading again, verify the repaired notification/unload path:
+   start `EchoVault.exe --guard`, deny `C:\test.txt` several times, and run
+   `filterctl status` in another window. The guard alone must receive the
+   notification; status/control clients must not stall. Close the guard and
+   repeat a denied open: it must return promptly with Access Denied. Then run
+   `filterctl disable`; unload should finish promptly and `sc qc
+   EchoVaultFilter` must show `DEMAND_START`.
+
+   Reboot the VM once without manually loading the driver. `filterctl status`
+   must report `Driver loaded now: No`. Treat either an automatic load or an
+   unload taking more than a few seconds as a failed test; restore the VM
+   snapshot and do not use that build on a host machine.
+
    To test the crash stand-off: load the driver, then pull the VM's power
    (VM menu: close → power off — a fake crash), restart, and run
    `filterctl status`. It should warn that the last shutdown was
@@ -239,9 +252,11 @@ it will actually occupy ~15-20 GB.
 - If the VM ever blue-screens: just restart the VM (or restore the
   "clean-base" snapshot). The VM's hard disk is isolated — your real
   machine is untouched.
-- Because this driver is **demand-start** (it only runs when you explicitly
-  load it), it can never break Windows booting. If you ever want it off:
-  `sc delete EchoVaultFilter` from Safe Mode if needed.
+- Because this driver is **demand-start** (it only runs when explicitly
+  loaded), this project does not arm it for the next boot. Kernel testing can
+  still crash the VM, which is why snapshots are mandatory. If needed:
+  `sc config EchoVaultFilter start= demand`, then
+  `sc delete EchoVaultFilter` from Safe Mode.
 
 ## Part E — Production signing (free) — only if you ship the driver
 
@@ -258,8 +273,8 @@ it will actually occupy ~15-20 GB.
 - **In the VM:** a bug = a VM restart. Cost: a minute. This is why the VM
   step is mandatory, not optional.
 - **On your real machine:** the driver only ever runs when you load it
-  (it does not auto-start at boot), it is fail-open, and it never touches
-  file contents — so the residual risk after VM testing + signing is small.
-  "Small" is not "zero": any kernel code can bugcheck. The final call on
+  (it does not auto-start at boot), kernel-originated opens fail open, and it
+  does not intentionally touch file contents. Any kernel code can still
+  bugcheck or corrupt memory. The final call on
   loading it on your daily machine is always yours, and it stays fully
   optional — EchoVault works without it.

@@ -56,6 +56,7 @@
 
 static PFLT_FILTER gFilter     = NULL;
 static PFLT_PORT   gServerPort = NULL;
+static PFLT_PORT   gNotifyClient = NULL;
 
 #define EV_MAX_ENTRIES 1024
 #define EV_POOL_TAG    'tfvE'      // pool tag for EvEntry
@@ -101,24 +102,27 @@ static NTSTATUS EvMapStatus(int rc)
 // dialog. Best-effort: if no client is connected the message is
 // dropped and the open is still denied.
 
-static KSPIN_LOCK gPortLock;
-
-// Multiple user-mode clients are connected at the same time: the guard
-// (long-lived listener for deny notifications) plus short-lived clients
-// (EchoVault app operations, filterctl). Track them all so that one
-// client disconnecting never cuts the others' notifications. The port
-// is created with this many connection slots (FltCreateCommunicationPort
-// below); with a single slot the guard would starve every other client
-// (FilterConnectCommunicationPort fails with ACCESS_DENIED when the
-// limit is reached).
+// Connections declare whether they are a control client or the guard.
+// Only the guard receives asynchronous deny notifications.  A FAST_MUTEX
+// serializes FltSendMessage with guard disconnect; FltCloseClientPort is
+// specifically designed to synchronize through the same client-port
+// variable that FltSendMessage receives.
 #define EV_MAX_CLIENTS 16
-static PFLT_PORT  gClients[EV_MAX_CLIENTS];
+static FAST_MUTEX gPortLock;
+static EX_RUNDOWN_REF gNotifyRundown;
+
+typedef struct _EV_CONNECTION {
+    PFLT_PORT Port;
+    BOOLEAN IsGuard;
+} EV_CONNECTION;
+
+#define EV_CONNECTION_TAG 'cfvE'
 
 // Build tag, embedded in the .sys so CI artifacts can be told apart
 // beyond doubt. Any .sys built before this tag does NOT contain the
 // string. Verify a downloaded driver with:
-//     findstr /c:"EVBUILD-PORTUSERS-20260818" EchoVaultFilter.sys
-const char EvBuildTag[] = "EVBUILD-PORTUSERS-20260818";
+//     findstr /c:"EVBUILD-SAFEUNLOAD-20260826" EchoVaultFilter.sys
+const char EvBuildTag[] = "EVBUILD-SAFEUNLOAD-20260826";
 
 // 2-second throttle: don't spam the guard with duplicate denies of
 // the same path (Explorer can retry opens rapidly).
@@ -185,24 +189,21 @@ static VOID EvNotifyWorker(_In_ PVOID Context)
     RtlCopyMemory(notify.RequesterApp, c->RequesterApp,
         EVFILTER_MAX_APP * sizeof(WCHAR));
 
-    // Snapshot the connected clients under the lock, then send to each
-    // outside it. Fire-and-forget: no reply is needed; a client that
-    // disconnected meanwhile just fails immediately and is skipped.
-    PFLT_PORT snapshot[EV_MAX_CLIENTS];
-    KIRQL irql;
-    ExAcquireSpinLock(&gPortLock, &irql);
-    for (ULONG i = 0; i < EV_MAX_CLIENTS; i++)
-        snapshot[i] = gClients[i];
-    ExReleaseSpinLock(&gPortLock, irql);
-
-    for (ULONG i = 0; i < EV_MAX_CLIENTS; i++)
-    {
-        if (snapshot[i])
-            FltSendMessage(gFilter, &snapshot[i], &notify, sizeof(notify),
-                NULL, NULL, NULL);
-    }
+    // Never wait indefinitely on a system worker thread.  If the guard is
+    // connected but has not posted FilterGetMessage yet, drop this best-
+    // effort notification after 250 ms.  Holding gPortLock makes the port
+    // variable stable until FltSendMessage returns; disconnect is bounded by
+    // the same timeout.
+    LARGE_INTEGER timeout;
+    timeout.QuadPart = -250LL * 10LL * 1000LL; // relative 250 ms, 100-ns units
+    ExAcquireFastMutex(&gPortLock);
+    if (gNotifyClient)
+        FltSendMessage(gFilter, &gNotifyClient, &notify, sizeof(notify),
+            NULL, NULL, &timeout);
+    ExReleaseFastMutex(&gPortLock);
 
     ExFreePoolWithTag(c, EV_NOTIFY_TAG);
+    ExReleaseRundownProtection(&gNotifyRundown);
 }
 
 // Queues the notification unless the same path was notified within
@@ -217,8 +218,10 @@ static VOID EvQueueDenyNotification(const UNICODE_STRING* name, const WCHAR* app
     if (chars >= EVFILTER_MAX_PATH)
         chars = EVFILTER_MAX_PATH - 1;
 
-    KIRQL irql;
-    ExAcquireSpinLock(&gPortLock, &irql);
+    if (!ExAcquireRundownProtection(&gNotifyRundown))
+        return;
+
+    ExAcquireFastMutex(&gPortLock);
 
     LARGE_INTEGER tickCount;
     KeQueryTickCount(&tickCount);
@@ -229,18 +232,10 @@ static VOID EvQueueDenyNotification(const UNICODE_STRING* name, const WCHAR* app
         (chars == evtPathChars(gLastNotifyPath, EVFILTER_MAX_PATH)) &&
         RtlEqualMemory(name->Buffer, gLastNotifyPath, chars * sizeof(WCHAR));
 
-    BOOLEAN anyClient = FALSE;
-    for (ULONG i = 0; i < EV_MAX_CLIENTS; i++)
+    if (throttled || !gNotifyClient)
     {
-        if (gClients[i])
-        {
-            anyClient = TRUE;
-            break;
-        }
-    }
-    if (throttled || !anyClient)
-    {
-        ExReleaseSpinLock(&gPortLock, irql);
+        ExReleaseFastMutex(&gPortLock);
+        ExReleaseRundownProtection(&gNotifyRundown);
         return;
     }
 
@@ -248,7 +243,8 @@ static VOID EvQueueDenyNotification(const UNICODE_STRING* name, const WCHAR* app
         POOL_FLAG_NON_PAGED, sizeof(EV_NOTIFY_CONTEXT), EV_NOTIFY_TAG);
     if (!c)
     {
-        ExReleaseSpinLock(&gPortLock, irql);
+        ExReleaseFastMutex(&gPortLock);
+        ExReleaseRundownProtection(&gNotifyRundown);
         return;
     }
 
@@ -260,7 +256,7 @@ static VOID EvQueueDenyNotification(const UNICODE_STRING* name, const WCHAR* app
 
     gLastNotifyTick = tick;
     RtlCopyMemory(gLastNotifyPath, c->Path, (chars + 1) * sizeof(WCHAR));
-    ExReleaseSpinLock(&gPortLock, irql);
+    ExReleaseFastMutex(&gPortLock);
 
     ExInitializeWorkItem(&c->Wq, EvNotifyWorker, c);
     ExQueueWorkItem(&c->Wq, DelayedWorkQueue);
@@ -373,42 +369,64 @@ static NTSTATUS EvConnectNotify(
     _Outptr_ PVOID* ConnectionPortCookie)
 {
     UNREFERENCED_PARAMETER(ServerPortCookie);
-    UNREFERENCED_PARAMETER(ConnectionContext);
-    UNREFERENCED_PARAMETER(SizeOfContext);
 
-    KIRQL irql;
-    ExAcquireSpinLock(&gPortLock, &irql);
-    for (ULONG i = 0; i < EV_MAX_CLIENTS; i++)
+    if (!ConnectionContext ||
+        SizeOfContext != sizeof(EVFILTER_CONNECT_CONTEXT))
+        return STATUS_INVALID_PARAMETER;
+
+    const EVFILTER_CONNECT_CONTEXT* request =
+        (const EVFILTER_CONNECT_CONTEXT*)ConnectionContext;
+    if (request->Magic != EVFILTER_CONNECT_MAGIC ||
+        (request->Role != EVFILTER_ROLE_CONTROL &&
+         request->Role != EVFILTER_ROLE_GUARD))
+        return STATUS_INVALID_PARAMETER;
+
+    EV_CONNECTION* connection = (EV_CONNECTION*)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED, sizeof(EV_CONNECTION), EV_CONNECTION_TAG);
+    if (!connection)
+        return STATUS_INSUFFICIENT_RESOURCES;
+
+    connection->Port = ClientPort;
+    connection->IsGuard = (request->Role == EVFILTER_ROLE_GUARD);
+
+    if (connection->IsGuard)
     {
-        if (gClients[i] == NULL)
+        ExAcquireFastMutex(&gPortLock);
+        if (gNotifyClient)
         {
-            gClients[i] = ClientPort;
-            break;
+            ExReleaseFastMutex(&gPortLock);
+            ExFreePoolWithTag(connection, EV_CONNECTION_TAG);
+            return STATUS_DEVICE_BUSY;
         }
+        gNotifyClient = ClientPort;
+        ExReleaseFastMutex(&gPortLock);
     }
-    ExReleaseSpinLock(&gPortLock, irql);
 
-    *ConnectionPortCookie = (PVOID)ClientPort;
+    *ConnectionPortCookie = connection;
     return STATUS_SUCCESS;
 }
 
 static VOID EvDisconnectNotify(_In_opt_ PVOID ConnectionCookie)
 {
-    UNREFERENCED_PARAMETER(ConnectionCookie);
+    EV_CONNECTION* connection = (EV_CONNECTION*)ConnectionCookie;
+    if (!connection)
+        return;
 
-    KIRQL irql;
-    ExAcquireSpinLock(&gPortLock, &irql);
-    PFLT_PORT who = (PFLT_PORT)ConnectionCookie;
-    for (ULONG i = 0; i < EV_MAX_CLIENTS; i++)
+    if (connection->IsGuard)
     {
-        if (who ? (gClients[i] == who) : (gClients[i] != NULL))
-        {
-            gClients[i] = NULL;
-            break;
-        }
+        ExAcquireFastMutex(&gPortLock);
+        if (gNotifyClient == connection->Port)
+            gNotifyClient = NULL;
+        gLastNotifyTick = 0;
+        FltCloseClientPort(gFilter, &connection->Port);
+        ExReleaseFastMutex(&gPortLock);
     }
-    gLastNotifyTick = 0;
-    ExReleaseSpinLock(&gPortLock, irql);
+    else
+    {
+        FltCloseClientPort(gFilter, &connection->Port);
+    }
+
+    ExFreePoolWithTag(connection, EV_CONNECTION_TAG);
 }
 
 static NTSTATUS EvMessageNotify(
@@ -419,7 +437,6 @@ static NTSTATUS EvMessageNotify(
     _In_ ULONG OutputBufferLength,
     _Out_ PULONG ReturnOutputBufferLength)
 {
-    UNREFERENCED_PARAMETER(PortCookie);
     UNREFERENCED_PARAMETER(OutputBuffer);
     UNREFERENCED_PARAMETER(OutputBufferLength);
     if (ReturnOutputBufferLength)
@@ -428,6 +445,10 @@ static NTSTATUS EvMessageNotify(
     if (!InputBuffer ||
         InputBufferLength < FIELD_OFFSET(EVFILTER_MSG, Path) + sizeof(WCHAR))
         return STATUS_INVALID_PARAMETER;
+
+    EV_CONNECTION* connection = (EV_CONNECTION*)PortCookie;
+    if (!connection || connection->IsGuard)
+        return STATUS_ACCESS_DENIED;
 
     EVFILTER_MSG* m = (EVFILTER_MSG*)InputBuffer;
 
@@ -442,11 +463,6 @@ static NTSTATUS EvMessageNotify(
     RtlInitUnicodeString(&path, m->Path);   // safe: NUL found within bounds
 
     NTSTATUS status = STATUS_SUCCESS;
-
-    // Translate the registration path to the device form the gate
-    // compares against (normalized names are \Device\... paths).
-    UNICODE_STRING devPath;
-    EvToDevicePath(&path, &devPath);
 
     // Exclusions live in their own table/lock: they are config, not path
     // state, and they are accessed only when an open is about to be
@@ -465,6 +481,12 @@ static NTSTATUS EvMessageNotify(
         ExReleaseFastMutex(&gExclLock);
         return status;
     }
+
+    // Translate path operations to the device form the gate compares
+    // against (normalized names are \Device\... paths).  Do this only for
+    // path operations; exclusion messages contain an executable base name.
+    UNICODE_STRING devPath;
+    EvToDevicePath(&path, &devPath);
 
     ExAcquireFastMutex(&gLock);
     switch (m->OpCode)
@@ -494,7 +516,14 @@ static FLT_PREOP_CALLBACK_STATUS EvPreCreate(
 {
     UNREFERENCED_PARAMETER(CompletionContext);
 
-    if (!FltObjects || !FltObjects->FileObject)
+    if (!Data || !FltObjects || !FltObjects->FileObject)
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+
+    // Never deny kernel-originated opens.  A user may accidentally register
+    // a broad directory, and blocking filesystem/Filter Manager activity in
+    // that tree can destabilize the machine.  EchoVault's security boundary
+    // is user-mode access to ciphertext, not kernel components.
+    if (Data->RequestorMode == KernelMode)
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
 
     PFLT_FILE_NAME_INFORMATION nameInfo = NULL;
@@ -556,6 +585,17 @@ static NTSTATUS EvFilterUnload(_In_ FLT_FILTER_UNLOAD_FLAGS Flags)
 {
     UNREFERENCED_PARAMETER(Flags);
 
+    // Stop new connections first.  Then put notifications into rundown and
+    // wait for every queued worker to return before the driver image can be
+    // unmapped.  Each worker has a 250-ms send timeout, so this wait is
+    // bounded even when the guard is hung.
+    if (gServerPort)
+    {
+        FltCloseCommunicationPort(gServerPort);
+        gServerPort = NULL;
+    }
+    ExWaitForRundownProtectionRelease(&gNotifyRundown);
+
     ExAcquireFastMutex(&gLock);
     evtClear(&gTable);
     ExReleaseFastMutex(&gLock);
@@ -564,29 +604,10 @@ static NTSTATUS EvFilterUnload(_In_ FLT_FILTER_UNLOAD_FLAGS Flags)
     evtExclClear(&gExcl);
     ExReleaseFastMutex(&gExclLock);
 
-    KIRQL irql;
-    ExAcquireSpinLock(&gPortLock, &irql);
-    PFLT_PORT toClose[EV_MAX_CLIENTS];
-    for (ULONG i = 0; i < EV_MAX_CLIENTS; i++)
-    {
-        toClose[i] = gClients[i];
-        gClients[i] = NULL;
-    }
-    gLastNotifyTick = 0;
-    ExReleaseSpinLock(&gPortLock, irql);
-    for (ULONG i = 0; i < EV_MAX_CLIENTS; i++)
-    {
-        if (toClose[i])
-            FltCloseClientPort(gFilter, &toClose[i]);
-    }
-
-    if (gServerPort)
-    {
-        FltCloseCommunicationPort(gServerPort);
-        gServerPort = NULL;
-    }
     if (gFilter)
     {
+        // FltMgr closes existing client connections during unregister and
+        // invokes EvDisconnectNotify while gFilter is still valid.
         FltUnregisterFilter(gFilter);
         gFilter = NULL;
     }
@@ -635,10 +656,10 @@ DriverEntry(
 
     ExInitializeFastMutex(&gLock);
     ExInitializeFastMutex(&gExclLock);
+    ExInitializeFastMutex(&gPortLock);
+    ExInitializeRundownProtection(&gNotifyRundown);
     gExcl.count = 0;
-    KeInitializeSpinLock(&gPortLock);
-    for (ULONG i = 0; i < EV_MAX_CLIENTS; i++)
-        gClients[i] = NULL;
+    gNotifyClient = NULL;
     gLastNotifyTick = 0;
     RtlZeroMemory(gLastNotifyPath, sizeof(gLastNotifyPath));
 

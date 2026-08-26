@@ -12,6 +12,18 @@
 // Communication port name (Filter Manager namespace).
 #define EVFILTER_PORT_NAME L"\\EchoVaultFilterPort"
 
+// Every user-mode connection declares its purpose.  The driver sends deny
+// notifications only to the single guard connection; control connections
+// are request/response only and must never receive asynchronous messages.
+#define EVFILTER_CONNECT_MAGIC 0x45564358UL  // "EVCX"
+#define EVFILTER_ROLE_CONTROL  1UL
+#define EVFILTER_ROLE_GUARD    2UL
+
+typedef struct _EVFILTER_CONNECT_CONTEXT {
+    ULONG Magic;
+    ULONG Role;
+} EVFILTER_CONNECT_CONTEXT;
+
 // Operations sent from user mode to the driver.
 #define EVFILTER_MSG_ADD        1   // register a path as encrypted: deny
                                     //   opens of it unless allow-listed

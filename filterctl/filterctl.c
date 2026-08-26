@@ -38,9 +38,16 @@
 #include "..\shared\evfilter.h"
 #include "..\filterstate.h"
 
-typedef HRESULT(WINAPI* FnConnect)(LPCWSTR, DWORD, LPCVOID, DWORD, LPVOID, HANDLE*);
+typedef HRESULT(WINAPI* FnConnect)(LPCWSTR, DWORD, LPCVOID, WORD, LPVOID, HANDLE*);
 typedef HRESULT(WINAPI* FnSend)(HANDLE, LPVOID, DWORD, LPVOID, DWORD, LPDWORD);
-typedef BOOL(WINAPI* FnClose)(HANDLE);
+
+static HRESULT ConnectControl(FnConnect connect, HANDLE* port)
+{
+    EVFILTER_CONNECT_CONTEXT context;
+    context.Magic = EVFILTER_CONNECT_MAGIC;
+    context.Role = EVFILTER_ROLE_CONTROL;
+    return connect(EVFILTER_PORT_NAME, 0, &context, sizeof(context), NULL, port);
+}
 
 static void PrintError(const wchar_t* what, HRESULT hr)
 {
@@ -88,7 +95,15 @@ static int RunCmd(const wchar_t* cmdline)
     if (!ok)
         return -1;
 
-    WaitForSingleObject(pi.hProcess, 60000);
+    DWORD wait = WaitForSingleObject(pi.hProcess, 15000);
+    if (wait == WAIT_TIMEOUT)
+    {
+        // Do not leave a wedged fltmc/sc helper running forever.  The driver
+        // service is changed to demand-start before unload is attempted, so
+        // even this failure cannot re-arm it for the next boot.
+        TerminateProcess(pi.hProcess, ERROR_TIMEOUT);
+        WaitForSingleObject(pi.hProcess, 2000);
+    }
     DWORD code = 0;
     if (!GetExitCodeProcess(pi.hProcess, &code))
         code = 0xFFFFFFFF;
@@ -97,40 +112,135 @@ static int RunCmd(const wchar_t* cmdline)
     return (int)code;
 }
 
+// Query the service without relying on localized command output.
+// Returns 1 on success (including "not installed"), 0 on API failure.
+static int QueryDriverService(int* installed, int* running)
+{
+    *installed = 0;
+    *running = 0;
+    SC_HANDLE mgr = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
+    if (!mgr)
+        return 0;
+
+    SC_HANDLE svc = OpenServiceW(mgr, L"EchoVaultFilter",
+        SERVICE_QUERY_STATUS);
+    if (!svc)
+    {
+        DWORD err = GetLastError();
+        CloseServiceHandle(mgr);
+        return err == ERROR_SERVICE_DOES_NOT_EXIST;
+    }
+
+    SERVICE_STATUS_PROCESS ss;
+    DWORD needed = 0;
+    BOOL ok = QueryServiceStatusEx(svc, SC_STATUS_PROCESS_INFO,
+        (LPBYTE)&ss, sizeof(ss), &needed);
+    if (ok)
+    {
+        *installed = 1;
+        *running = (ss.dwCurrentState != SERVICE_STOPPED);
+    }
+    CloseServiceHandle(svc);
+    CloseServiceHandle(mgr);
+    return ok ? 1 : 0;
+}
+
+// Demote an existing service before doing anything that might hang.  This is
+// the critical boot-loop breaker: after it succeeds the OS will not load the
+// driver automatically, even if the current unload attempt crashes.
+static int SetExistingServiceDemandStart(int* installedOut)
+{
+    *installedOut = 0;
+    SC_HANDLE mgr = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
+    if (!mgr)
+        return 0;
+
+    SC_HANDLE svc = OpenServiceW(mgr, L"EchoVaultFilter",
+        SERVICE_CHANGE_CONFIG);
+    if (!svc)
+    {
+        DWORD err = GetLastError();
+        CloseServiceHandle(mgr);
+        return err == ERROR_SERVICE_DOES_NOT_EXIST;
+    }
+
+    *installedOut = 1;
+    BOOL ok = ChangeServiceConfigW(svc, SERVICE_NO_CHANGE,
+        SERVICE_DEMAND_START, SERVICE_NO_CHANGE, NULL, NULL, NULL, NULL,
+        NULL, NULL, NULL);
+    CloseServiceHandle(svc);
+    CloseServiceHandle(mgr);
+    return ok ? 1 : 0;
+}
+
+// Create or update the driver service.  It is deliberately demand-start;
+// production boot-start is not permitted by this development tool.
+static int EnsureDemandStartService(const wchar_t* binaryPath)
+{
+    SC_HANDLE mgr = OpenSCManagerW(NULL, NULL,
+        SC_MANAGER_CONNECT | SC_MANAGER_CREATE_SERVICE);
+    if (!mgr)
+        return 0;
+
+    SC_HANDLE svc = CreateServiceW(mgr, L"EchoVaultFilter",
+        L"EchoVaultFilter", SERVICE_CHANGE_CONFIG | SERVICE_QUERY_STATUS,
+        SERVICE_FILE_SYSTEM_DRIVER, SERVICE_DEMAND_START,
+        SERVICE_ERROR_NORMAL, binaryPath, NULL, NULL, NULL, NULL, NULL);
+    if (!svc && GetLastError() == ERROR_SERVICE_EXISTS)
+        svc = OpenServiceW(mgr, L"EchoVaultFilter",
+            SERVICE_CHANGE_CONFIG | SERVICE_QUERY_STATUS);
+
+    BOOL ok = FALSE;
+    if (svc)
+    {
+        ok = ChangeServiceConfigW(svc, SERVICE_FILE_SYSTEM_DRIVER,
+            SERVICE_DEMAND_START, SERVICE_ERROR_NORMAL, binaryPath,
+            NULL, NULL, NULL, NULL, NULL, L"EchoVaultFilter");
+        CloseServiceHandle(svc);
+    }
+    CloseServiceHandle(mgr);
+    return ok ? 1 : 0;
+}
+
 // ---- verbs --------------------------------------------------------
 
 // Register the minifilter's altitude in the service registry key, the
 // way a driver INF normally would. Without an altitude the filter
 // manager can load the driver but will never attach it to any volume.
-static void RegSetStr(HKEY key, const wchar_t* name, const wchar_t* value)
+static int RegSetStr(HKEY key, const wchar_t* name, const wchar_t* value)
 {
-    RegSetValueExW(key, name, 0, REG_SZ, (const BYTE*)value,
-                   (DWORD)((wcslen(value) + 1) * sizeof(wchar_t)));
+    return RegSetValueExW(key, name, 0, REG_SZ, (const BYTE*)value,
+        (DWORD)((wcslen(value) + 1) * sizeof(wchar_t))) == ERROR_SUCCESS;
 }
 
-static void RegisterFilterAltitude(const wchar_t* service,
-                                   const wchar_t* instance,
-                                   const wchar_t* altitude)
+static int RegisterFilterAltitude(const wchar_t* service,
+                                  const wchar_t* instance,
+                                  const wchar_t* altitude)
 {
     wchar_t path[512];
     HKEY hk;
+    int ok = 1;
     wsprintfW(path, L"SYSTEM\\CurrentControlSet\\Services\\%s\\Instances", service);
     if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, path, 0, NULL, 0, KEY_SET_VALUE,
                         NULL, &hk, NULL) == ERROR_SUCCESS)
     {
-        RegSetStr(hk, L"DefaultInstance", instance);
+        ok = RegSetStr(hk, L"DefaultInstance", instance) && ok;
         RegCloseKey(hk);
     }
+    else ok = 0;
     wsprintfW(path, L"SYSTEM\\CurrentControlSet\\Services\\%s\\Instances\\%s",
               service, instance);
     if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, path, 0, NULL, 0, KEY_SET_VALUE,
                         NULL, &hk, NULL) == ERROR_SUCCESS)
     {
-        RegSetStr(hk, L"Altitude", altitude);
+        ok = RegSetStr(hk, L"Altitude", altitude) && ok;
         DWORD flags = 0;
-        RegSetValueExW(hk, L"Flags", 0, REG_DWORD, (const BYTE*)&flags, sizeof(flags));
+        ok = (RegSetValueExW(hk, L"Flags", 0, REG_DWORD,
+            (const BYTE*)&flags, sizeof(flags)) == ERROR_SUCCESS) && ok;
         RegCloseKey(hk);
     }
+    else ok = 0;
+    return ok;
 }
 
 static int CmdLoad(int argc, wchar_t** wargv)
@@ -179,34 +289,38 @@ static int CmdLoad(int argc, wchar_t** wargv)
             wprintf(L"(note: could not check whether the last shutdown was clean)\n");
     }
 
+    // Demote any service left by an older build before checking whether it
+    // is running.  A stale boot-start setting must never survive this tool.
+    int serviceInstalled = 0;
+    if (!SetExistingServiceDemandStart(&serviceInstalled))
+    {
+        wprintf(L"ERROR: could not change the existing driver service to\n"
+                L"demand-start. Run as administrator. The driver was NOT loaded.\n");
+        return 1;
+    }
+
+    if (serviceInstalled)
+    {
+        int installed = 0, running = 0;
+        if (!QueryDriverService(&installed, &running))
+        {
+            wprintf(L"ERROR: could not query the existing driver service.\n");
+            return 1;
+        }
+        if (running)
+        {
+            wprintf(L"OK: the driver is already loaded. Its service is now\n"
+                    L"demand-start and will not load automatically at boot.\n");
+            return 0;
+        }
+    }
+
     if (GetFileAttributesW(sysPath) == INVALID_FILE_ATTRIBUTES)
     {
     wprintf(L"ERROR: '%ls' not found. Build the driver first (see\n"
             L"driver/BUILD-TEST-RUNBOOK.md), then pass its path:\n"
             L"    filterctl load <path-to-EchoVaultFilter.sys>\n", sysPath);
         return 1;
-    }
-
-    // Already running? Nothing to do.
-    {
-        SC_HANDLE mgr = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
-        if (mgr)
-        {
-            SC_HANDLE svc = OpenServiceW(mgr, L"EchoVaultFilter", SERVICE_QUERY_STATUS);
-            if (svc)
-            {
-                SERVICE_STATUS ss;
-                if (QueryServiceStatus(svc, &ss) && ss.dwCurrentState == SERVICE_RUNNING)
-                {
-                    CloseServiceHandle(svc);
-                    CloseServiceHandle(mgr);
-                    wprintf(L"OK: the driver is already loaded.\n");
-                    return 0;
-                }
-                CloseServiceHandle(svc);
-            }
-            CloseServiceHandle(mgr);
-        }
     }
 
     // Copy the driver to the canonical drivers directory. Kernel driver
@@ -225,19 +339,21 @@ static int CmdLoad(int argc, wchar_t** wargv)
         return 1;
     }
 
-    // Recreate the service from scratch so a stale ImagePath from an
-    // earlier attempt can never poison the load ("not installed" and
-    // "does not exist" results are expected and ignored).
-    RunCmd(L"sc delete EchoVaultFilter");
-
-    wchar_t cmd[2048];
-    // start= boot: auto-load with Filter Manager at every boot, so locked
-    // files stay locked without a manual fltmc load after a reboot.
-    wsprintfW(cmd, L"sc create EchoVaultFilter type= kernel start= boot binPath= \"%s\"", destPath);
-    RunCmd(cmd);
+    if (!EnsureDemandStartService(destPath))
+    {
+        wprintf(L"ERROR: could not create/update the demand-start driver service.\n"
+                L"The driver was NOT loaded. Run as administrator.\n");
+        return 1;
+    }
 
     // Register the altitude (the INF normally does this).
-    RegisterFilterAltitude(L"EchoVaultFilter", L"EchoVaultFilter Instance", L"360000");
+    if (!RegisterFilterAltitude(L"EchoVaultFilter",
+            L"EchoVaultFilter Instance", L"360000"))
+    {
+        wprintf(L"ERROR: could not register the minifilter altitude.\n"
+                L"The service remains demand-start and was NOT loaded.\n");
+        return 1;
+    }
 
     // Attach the minifilter to Filter Manager.
     int rc = RunCmd(L"fltmc load EchoVaultFilter");
@@ -251,42 +367,96 @@ static int CmdLoad(int argc, wchar_t** wargv)
 
     FILETIME ft;
     GetSystemTimeAsFileTime(&ft);
-    EvFsSetLoaded(((ULONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime);
-    wprintf(L"OK: driver loaded and registered (installed at %ls).\n"
+    if (!EvFsSetLoaded(((ULONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime))
+    {
+        EvFsSetDisabled(1);
+        int unloadRc = RunCmd(L"fltmc unload EchoVaultFilter");
+        wprintf(L"ERROR: the load-safety marker could not be saved. The\n"
+                L"off-switch was set and emergency unload returned %d.\n"
+                L"The service remains demand-start.\n", unloadRc);
+        return 1;
+    }
+    wprintf(L"OK: driver loaded on demand (installed at %ls).\n"
+            L"It will NOT load automatically at boot.\n"
             L"Off-switch: 'filterctl disable'.\n", destPath);
     return 0;
 }
 
 static int CmdDisable(void)
 {
-    // Unload if running (best effort — may already be unloaded).
-    RunCmd(L"fltmc unload EchoVaultFilter");
+    // Persist both safety barriers BEFORE asking the kernel to unload.  If
+    // unload hangs and the machine is reset, the service is already
+    // demand-start and filterctl will still refuse a later manual load.
+    if (!EvFsSetDisabled(1))
+    {
+        wprintf(L"ERROR: could not set the persistent off-switch.\n"
+                L"The unload was not attempted.\n");
+        return 1;
+    }
 
-    // The service is normally boot-start (auto-loads with Filter Manager).
-    // Demote it to demand-start so nothing pulls the driver back in on the
-    // next boot — that is what "keep unloaded across reboots" means now.
-    RunCmd(L"sc config EchoVaultFilter start= demand");
+    int serviceInstalled = 0;
+    if (!SetExistingServiceDemandStart(&serviceInstalled))
+    {
+        wprintf(L"ERROR: the off-switch is set, but the service could not be\n"
+                L"changed to demand-start. Do NOT reboot until this is fixed.\n");
+        return 1;
+    }
+
+    int installed = 0, running = 0;
+    if (!QueryDriverService(&installed, &running))
+    {
+        wprintf(L"ERROR: the off-switch is set and the service is demand-start,\n"
+                L"but its current state could not be queried.\n");
+        return 1;
+    }
+
+    if (running)
+    {
+        int rc = RunCmd(L"fltmc unload EchoVaultFilter");
+        int installedAfter = 0, runningAfter = 1;
+        int queried = QueryDriverService(&installedAfter, &runningAfter);
+        if (rc != 0 || !queried || runningAfter)
+        {
+            wprintf(L"ERROR: the driver did not unload cleanly (exit %d).\n"
+                    L"The persistent off-switch IS set and the service IS\n"
+                    L"demand-start, so it will not load on the next boot.\n", rc);
+            return 1;
+        }
+    }
 
     FILETIME ft;
     GetSystemTimeAsFileTime(&ft);
-    EvFsSetUnloaded(((ULONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime);
-    EvFsSetDisabled(1);
-    wprintf(L"OK: driver unloaded (if it was running) and the off-switch is set.\n"
-            L"It will stay unloaded across reboots until you run:\n"
-            L"    filterctl enable\n"
-            L"    filterctl load\n");
+    if (!EvFsSetUnloaded(((ULONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime))
+    {
+        wprintf(L"ERROR: the driver is unloaded and demand-start, but the clean\n"
+                L"unload marker could not be saved. The off-switch remains set.\n");
+        return 1;
+    }
+    wprintf(L"OK: driver unloaded, service set to demand-start, and the\n"
+            L"persistent off-switch is set. It will stay off across reboots.\n");
     return 0;
 }
 
 static int CmdEnable(void)
 {
-    // Restore boot-start so the driver auto-loads again on the next boot.
-    RunCmd(L"sc config EchoVaultFilter start= boot");
-
-    EvFsSetDisabled(0);
-    wprintf(L"OK: off-switch cleared. The driver will auto-load on the next\n"
-            L"boot; to start it right now:\n"
-            L"    filterctl load   (as administrator)\n");
+    // Enabling only permits a future explicit load.  It never opts the
+    // machine back into boot-start.
+    if (!EvFsSetDisabled(0))
+    {
+        wprintf(L"ERROR: could not clear the off-switch.\n");
+        return 1;
+    }
+    int installed = 0;
+    if (!SetExistingServiceDemandStart(&installed))
+    {
+        EvFsSetDisabled(1);
+        wprintf(L"ERROR: could not verify demand-start; the off-switch was\n"
+                L"restored for safety.\n");
+        return 1;
+    }
+    wprintf(L"OK: off-switch cleared. The service remains demand-start.\n"
+            L"To start the driver explicitly, run as administrator:\n"
+            L"    filterctl load\n");
     return 0;
 }
 
@@ -333,8 +503,7 @@ int main(void)
     }
     FnConnect pConnect = (FnConnect)(void*)GetProcAddress(hFltlib, "FilterConnectCommunicationPort");
     FnSend    pSend    = (FnSend)(void*)GetProcAddress(hFltlib, "FilterSendMessage");
-    FnClose   pClose   = (FnClose)(void*)GetProcAddress(hFltlib, "FilterClose");
-    if (!pConnect || !pSend || !pClose)
+    if (!pConnect || !pSend)
     {
         wprintf(L"fltlib.dll is missing required exports\n");
         return 1;
@@ -345,11 +514,11 @@ int main(void)
     {
         HANDLE hProbe = INVALID_HANDLE_VALUE;
         int loaded = 0;
-        HRESULT hr = pConnect(EVFILTER_PORT_NAME, 0, NULL, 0, NULL, &hProbe);
+        HRESULT hr = ConnectControl(pConnect, &hProbe);
         if (SUCCEEDED(hr) && hProbe != INVALID_HANDLE_VALUE && hProbe != NULL)
         {
             loaded = 1;
-            pClose(hProbe);
+            CloseHandle(hProbe);
         }
         wchar_t report[4096];
         EvFsBuildReport(report, 4096, loaded);
@@ -360,7 +529,7 @@ int main(void)
 
     // ---- Connect to the driver for the port operations ----
     HANDLE hPort = INVALID_HANDLE_VALUE;
-    HRESULT hr = pConnect(EVFILTER_PORT_NAME, 0, NULL, 0, NULL, &hPort);
+    HRESULT hr = ConnectControl(pConnect, &hPort);
     if (FAILED(hr) || hPort == INVALID_HANDLE_VALUE || hPort == NULL)
     {
         PrintError(L"FilterConnectCommunicationPort", hr);
@@ -381,7 +550,7 @@ int main(void)
         if (nArgs < 3)
         {
             Usage();
-            pClose(hPort);
+            CloseHandle(hPort);
             LocalFree(wargv);
             return 1;
         }
@@ -401,7 +570,7 @@ int main(void)
         {
             wprintf(L"Unknown verb: %ls\n", verb);
             Usage();
-            pClose(hPort);
+            CloseHandle(hPort);
             LocalFree(wargv);
             return 1;
         }
@@ -419,7 +588,7 @@ int main(void)
     if (FAILED(hr))
     {
         PrintError(L"FilterSendMessage", hr);
-        pClose(hPort);
+        CloseHandle(hPort);
         LocalFree(wargv);
         return 3;
     }
@@ -439,7 +608,7 @@ int main(void)
     else
         wprintf(L"OK: %ls: %ls\n", verb, wargv[2]);
 
-    pClose(hPort);
+    CloseHandle(hPort);
     LocalFree(wargv);
     return 0;
 }

@@ -9,7 +9,7 @@ Signature   = "$WINDOWS NT$"
 Class       = "ActivityMonitor"
 ClassGuid   = {b86dff51-a31e-4bac-b3cf-e8c898bd5d53}
 Provider    = %ProviderName%
-DriverVer   = 08/18/2026,1.0.3.0
+DriverVer   = 08/26/2026,1.0.4.0
 CatalogFile = EchoVaultFilter.cat
 
 [DestinationDirs]
@@ -27,7 +27,7 @@ EchoVaultFilter.sys = 12
 [EchoVaultFilter_Service_Inst]
 DisplayName   = %ServiceName%
 ServiceType   = 2        ; SERVICE_FILE_SYSTEM_DRIVER
-StartType     = 0        ; SERVICE_BOOT_START (auto-loads with Filter Manager)
+StartType     = 3        ; SERVICE_DEMAND_START (explicit VM-tested load only)
 ErrorControl  = 1        ; SERVICE_ERROR_NORMAL (boot continues on failure)
 ServiceBinary = %12%\EchoVaultFilter.sys
 AddReg        = EchoVaultFilter_AddReg

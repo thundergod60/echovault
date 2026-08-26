@@ -1,33 +1,9 @@
-#------------------------------------------------------------
-# Build the EchoVault minifilter in the cloud.
-#
-# Why: building a kernel driver normally needs Visual Studio +
-# WDK (~8 GB) — too heavy for this laptop. This workflow does
-# the build on a free GitHub Actions Windows runner and returns
-# the finished EchoVaultFilter.sys as a downloadable artifact
-# (a few dozen KB). Your machine downloads only the result.
-#
-# How: this follows Microsoft's own driver CI (see the
-# Windows-driver-samples repo, .github/Build-with-GitHub.md):
-#   * windows-2025-vs2026 runner — Visual Studio preinstalled.
-#   * The WDK is restored as NuGet packages (packages.config +
-#     Directory.Build.props), which provide the headers, libs,
-#     and the WindowsKernelModeDriver10.0 platform toolset that
-#     the .vcxproj uses. No machine-wide WDK install needed.
-#
-# How to use:
-#   1. Push this project to a GitHub repository.
-#   2. Open the repo's "Actions" tab -> "Build EchoVault driver"
-#      (or just push a change to driver/).
-#   3. When it finishes, open the run, scroll to "Artifacts",
-#      download "EchoVaultFilter-sys".
-#------------------------------------------------------------
-
 name: Build EchoVault driver
 
 on:
-  workflow_dispatch:            # manual "Run workflow" button
+  workflow_dispatch:
   push:
+    branches: [main]
     paths:
       - 'driver/**'
       - 'shared/**'
@@ -35,47 +11,96 @@ on:
       - 'Directory.Build.props'
       - '.github/workflows/build-driver.yml'
 
+permissions:
+  contents: read
+
+concurrency:
+  group: driver-build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-driver:
-    runs-on: windows-2025-vs2026   # VS preinstalled; WDK comes from NuGet
+    name: Validate and build x64 driver
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 30
+
     steps:
-      - name: Checkout
+      - name: Check out source
         uses: actions/checkout@v4
 
-      - name: Restore WDK packages (NuGet)
+      - name: Run source safety checks
         shell: pwsh
-        run: |
-          nuget restore packages.config -PackagesDirectory packages
+        run: ./driver/test-driver-safety.ps1
+
+      - name: Set up NuGet
+        uses: NuGet/setup-nuget@v2
+
+      - name: Restore WDK and SDK packages
+        shell: pwsh
+        run: nuget restore packages.config -PackagesDirectory packages -NonInteractive
 
       - name: Add MSBuild to PATH
         uses: microsoft/setup-msbuild@v2
 
-      - name: Build driver (x64 Release)
-        # NOTE: OutDir/IntDir use forward slashes and NO quotes — a path
-        # ending in backslash-before-quote would be mangled by cmd/MSBuild
-        # (\\" escapes the quote). Workspace paths never contain spaces.
-        shell: cmd
-        run: |
-          msbuild driver\EchoVaultFilter.vcxproj /p:Configuration=Release /p:Platform=x64 /p:OutDir=%GITHUB_WORKSPACE%/driver/bin/x64/Release/ /p:IntDir=%GITHUB_WORKSPACE%/driver/obj/x64/Release/ /m
-
-      - name: Verify the gate logic on a fresh machine (best-effort)
-        # The deny/allow/exclusion logic test (shared/evtable.h) compiled
-        # and run here, so the first run proves the decisions are sound
-        # even before any kernel is involved. Best-effort: never blocks
-        # the artifact. Uses the preinstalled VS via vswhere.
+      - name: Run user-mode driver logic tests
         shell: pwsh
-        continue-on-error: true
         run: |
           $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
           $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-          if (-not $vs) { Write-Host 'vswhere: no Visual Studio found; skipping gate check'; exit 0 }
+          if (-not $vs) { throw 'Visual Studio C++ tools were not found on the runner.' }
           $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
-          cmd /c "`"$vcvars`" >nul 2>&1 && cl /nologo /O2 /W3 driver\test-evtable.c /Fe:test-evtable.exe /link user32.lib && test-evtable.exe"
+          $command = "`"$vcvars`" >nul && " +
+            "cl /nologo /O2 /W4 driver\test-evtable.c /Fe:test-evtable.exe && test-evtable.exe && " +
+            "cl /nologo /O2 /W4 /I driver\stubcheck driver\stubcheck\test-evdevpath.c /Fe:test-evdevpath.exe && test-evdevpath.exe"
+          cmd /d /s /c $command
+          if ($LASTEXITCODE -ne 0) { throw "Driver logic tests failed with exit code $LASTEXITCODE." }
 
-      - name: Upload artifact
+      - name: Build x64 Release driver
+        shell: pwsh
+        run: |
+          $outDir = "$env:GITHUB_WORKSPACE/driver/bin/x64/Release"
+          $intDir = "$env:GITHUB_WORKSPACE/driver/obj/x64/Release"
+          msbuild driver\EchoVaultFilter.vcxproj `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            "/p:OutDir=$outDir/" `
+            "/p:IntDir=$intDir/" `
+            "/bl:$outDir/EchoVaultFilter.binlog" `
+            /m
+          if ($LASTEXITCODE -ne 0) { throw "MSBuild failed with exit code $LASTEXITCODE." }
+
+      - name: Verify and describe artifact
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:GITHUB_WORKSPACE 'driver\bin\x64\Release'
+          $sys = Join-Path $out 'EchoVaultFilter.sys'
+          if (-not (Test-Path -LiteralPath $sys)) { throw 'MSBuild succeeded but EchoVaultFilter.sys is missing.' }
+
+          $tag = 'EVBUILD-SAFEUNLOAD-20260826'
+          $ascii = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($sys))
+          if (-not $ascii.Contains($tag)) { throw "The built driver does not contain expected tag $tag." }
+
+          $hash = (Get-FileHash -LiteralPath $sys -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -LiteralPath (Join-Path $out 'EchoVaultFilter.sys.sha256') `
+            -Value "$hash  EchoVaultFilter.sys" -Encoding ascii
+          @(
+            "commit=$env:GITHUB_SHA"
+            "run=$env:GITHUB_RUN_ID"
+            "build_tag=$tag"
+            "sha256=$hash"
+            'start_type=SERVICE_DEMAND_START'
+            'host_driver_loaded=false'
+          ) | Set-Content -LiteralPath (Join-Path $out 'build-info.txt') -Encoding ascii
+
+      - name: Upload driver artifact
         uses: actions/upload-artifact@v4
         with:
-          name: EchoVaultFilter-sys
+          name: EchoVaultFilter-x64
+          if-no-files-found: error
+          retention-days: 14
           path: |
             driver/bin/x64/Release/EchoVaultFilter.sys
+            driver/bin/x64/Release/EchoVaultFilter.sys.sha256
+            driver/bin/x64/Release/build-info.txt
+            driver/bin/x64/Release/EchoVaultFilter.binlog
             driver/EchoVaultFilter.inf
