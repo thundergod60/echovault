@@ -50,7 +50,8 @@ jobs:
         with:
           languages: c-cpp
           build-mode: manual
-          packs: microsoft/windows-drivers@1.10.0:windows-driver-suites/recommended.qls
+          # Microsoft's driver suite imports queries from both pinned packs.
+          packs: microsoft/cpp-queries@0.0.5,microsoft/windows-drivers@1.10.0:windows-driver-suites/recommended.qls
 
       - name: Build x64 Release driver for CodeQL
         shell: pwsh

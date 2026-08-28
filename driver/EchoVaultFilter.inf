@@ -7,13 +7,20 @@
 [Version]
 Signature   = "$WINDOWS NT$"
 Class       = "ActivityMonitor"
-ClassGuid   = {b86dff51-a31e-4bac-b3cf-e8c898bd5d53}
+ClassGuid   = {b86dff51-a31e-4bac-b3cf-e8cfe75c9fc2}
 Provider    = %ProviderName%
-DriverVer   = 08/26/2026,1.0.4.0
+DriverVer   = 08/28/2026,1.0.5.0
 CatalogFile = EchoVaultFilter.cat
+PnpLockdown = 1
 
 [DestinationDirs]
-DefaultDestDir = 12
+DriverFiles.NTamd64 = 13
+
+[SourceDisksFiles]
+EchoVaultFilter.sys = 1,,
+
+[SourceDisksNames]
+1 = %DiskName%,,,
 
 [DefaultInstall.NTamd64]
 CopyFiles = DriverFiles.NTamd64
@@ -22,24 +29,25 @@ CopyFiles = DriverFiles.NTamd64
 AddService = EchoVaultFilter,, EchoVaultFilter_Service_Inst
 
 [DriverFiles.NTamd64]
-EchoVaultFilter.sys = 12
+EchoVaultFilter.sys
 
 [EchoVaultFilter_Service_Inst]
 DisplayName   = %ServiceName%
 ServiceType   = 2        ; SERVICE_FILE_SYSTEM_DRIVER
 StartType     = 3        ; SERVICE_DEMAND_START (explicit VM-tested load only)
 ErrorControl  = 1        ; SERVICE_ERROR_NORMAL (boot continues on failure)
-ServiceBinary = %12%\EchoVaultFilter.sys
+ServiceBinary = %13%\EchoVaultFilter.sys
 AddReg        = EchoVaultFilter_AddReg
 
 ; The altitude is REQUIRED: the filter manager cannot attach a
 ; minifilter to any volume without it. 360000 is the ActivityMonitor
 ; class range (360000-369999).
 [EchoVaultFilter_AddReg]
-HKR, "Instances", "DefaultInstance", 0x00000000, "EchoVaultFilter Instance"
-HKR, "Instances\EchoVaultFilter Instance", "Altitude", 0x00000000, "360000"
-HKR, "Instances\EchoVaultFilter Instance", "Flags", 0x00010001, 0
+HKR, "Parameters\Instances", "DefaultInstance", 0x00000000, "EchoVaultFilter Instance"
+HKR, "Parameters\Instances\EchoVaultFilter Instance", "Altitude", 0x00000000, "360000"
+HKR, "Parameters\Instances\EchoVaultFilter Instance", "Flags", 0x00010001, 0
 
 [Strings]
 ProviderName = "EchoVault"
 ServiceName  = "EchoVaultFilter"
+DiskName     = "EchoVaultFilter installation media"
