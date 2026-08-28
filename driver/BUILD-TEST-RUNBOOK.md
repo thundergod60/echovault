@@ -3,9 +3,10 @@
 How to actually compile the driver and test it, on your machine (i3, 4 GB
 RAM, screen reader). Written as numbered, keyboard-friendly steps.
 
-**The golden rule: all driver testing happens inside a Virtual Machine.
-A crash there costs nothing (the VM just restarts). Your real machine and
-your screen reader are never at risk from testing.**
+**The golden rule: a green cloud build is not proof that kernel code is
+crash-free. A separate test Windows installation remains the safest place
+for final runtime testing. Never configure this driver for boot or automatic
+start.**
 
 > **Storage reality check (August 2026):** this laptop has only ~0.1 GB
 > free, so a VM is NOT possible right now, and the local toolchain
@@ -20,6 +21,15 @@ your screen reader are never at risk from testing.**
 > but not a blocker for trusting the deny/allow decisions, and it can be
 > done on ANY machine with space (a friend's computer, a lab machine),
 > not necessarily this one.
+
+> **Low-RAM fallback:** EchoVault now suppresses automatic volume attachment
+> in both the INF and the driver itself. Loading it filters no volumes. If no
+> separate computer or VM exists, the least-risk functional smoke test is an
+> explicit attachment to a small disposable VHDX data volume. A VHDX data
+> disk is not a VM and consumes negligible RAM. This protects the Windows
+> volume from the filter's allow/deny logic, but the driver still runs in the
+> host kernel, so a coding error can still crash the laptop. Do not use Driver
+> Verifier or attach to the Windows volume for this fallback test.
 
 ---
 

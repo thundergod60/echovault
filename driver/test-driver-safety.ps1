@@ -17,8 +17,11 @@ function Test-SafetyRule([bool]$Condition, [string]$Name) {
 }
 
 Test-SafetyRule ($inf -match '(?m)^StartType\s*=\s*3\b') 'INF is demand-start'
+Test-SafetyRule ($inf -match '(?m)^HKR,\s*"Parameters\\Instances\\EchoVaultFilter Instance",\s*"Flags",\s*0x00010001,\s*1\s*$') 'INF suppresses automatic volume attachment'
 Test-SafetyRule ($control -match 'SERVICE_DEMAND_START') 'control tool enforces demand-start'
 Test-SafetyRule ($control -notmatch 'start\s*=\s*boot') 'control tool contains no boot-start command'
+Test-SafetyRule ($control -match 'Parameters\\\\Instances' -and $control -match 'DWORD flags = 1') 'control tool suppresses automatic volume attachment'
+Test-SafetyRule ($driver -match 'EvInstanceSetup' -and $driver -match 'FLTFL_INSTANCE_SETUP_MANUAL_ATTACHMENT' -and $driver -match 'STATUS_FLT_DO_NOT_ATTACH') 'driver accepts only explicit manual volume attachment'
 Test-SafetyRule ($driver -match 'ExWaitForRundownProtectionRelease') 'unload drains notification workers'
 Test-SafetyRule ($driver -match 'FltSendMessage[\s\S]{0,250}&timeout') 'kernel-to-user send has a timeout'
 Test-SafetyRule ($driver -match 'EVFILTER_ROLE_GUARD') 'notifications use a guard-only connection'

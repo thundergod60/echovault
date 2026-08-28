@@ -220,7 +220,9 @@ static int RegisterFilterAltitude(const wchar_t* service,
     wchar_t path[512];
     HKEY hk;
     int ok = 1;
-    wsprintfW(path, L"SYSTEM\\CurrentControlSet\\Services\\%s\\Instances", service);
+    wsprintfW(path,
+        L"SYSTEM\\CurrentControlSet\\Services\\%s\\Parameters\\Instances",
+        service);
     if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, path, 0, NULL, 0, KEY_SET_VALUE,
                         NULL, &hk, NULL) == ERROR_SUCCESS)
     {
@@ -228,13 +230,16 @@ static int RegisterFilterAltitude(const wchar_t* service,
         RegCloseKey(hk);
     }
     else ok = 0;
-    wsprintfW(path, L"SYSTEM\\CurrentControlSet\\Services\\%s\\Instances\\%s",
-              service, instance);
+    wsprintfW(path,
+        L"SYSTEM\\CurrentControlSet\\Services\\%s\\Parameters\\Instances\\%s",
+        service, instance);
     if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, path, 0, NULL, 0, KEY_SET_VALUE,
                         NULL, &hk, NULL) == ERROR_SUCCESS)
     {
         ok = RegSetStr(hk, L"Altitude", altitude) && ok;
-        DWORD flags = 0;
+        // Loading must never attach to every mounted volume.  A disposable
+        // test volume is attached later with an explicit fltmc request.
+        DWORD flags = 1;
         ok = (RegSetValueExW(hk, L"Flags", 0, REG_DWORD,
             (const BYTE*)&flags, sizeof(flags)) == ERROR_SUCCESS) && ok;
         RegCloseKey(hk);
@@ -377,7 +382,8 @@ static int CmdLoad(int argc, wchar_t** wargv)
         return 1;
     }
     wprintf(L"OK: driver loaded on demand (installed at %ls).\n"
-            L"It will NOT load automatically at boot.\n"
+            L"It will NOT load automatically at boot and is NOT attached\n"
+            L"to any volume. Attach only a disposable test volume explicitly.\n"
             L"Off-switch: 'filterctl disable'.\n", destPath);
     return 0;
 }

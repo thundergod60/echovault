@@ -50,8 +50,10 @@ jobs:
         with:
           languages: c-cpp
           build-mode: manual
-          # Microsoft's driver suite imports queries from both pinned packs.
-          packs: microsoft/cpp-queries@0.0.5,microsoft/windows-drivers@1.10.0:windows-driver-suites/recommended.qls
+          # The driver suite imports microsoft/cpp-queries. Select one query
+          # already present in that suite so the companion pack is installed
+          # without running its unrelated example/default query collection.
+          packs: microsoft/cpp-queries@0.0.5:Microsoft/Security/Cryptography/BannedEncryption.ql,microsoft/windows-drivers@1.10.0:windows-driver-suites/recommended.qls
 
       - name: Build x64 Release driver for CodeQL
         shell: pwsh

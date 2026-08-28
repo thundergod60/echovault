@@ -45,7 +45,9 @@ AddReg        = EchoVaultFilter_AddReg
 [EchoVaultFilter_AddReg]
 HKR, "Parameters\Instances", "DefaultInstance", 0x00000000, "EchoVaultFilter Instance"
 HKR, "Parameters\Instances\EchoVaultFilter Instance", "Altitude", 0x00000000, "360000"
-HKR, "Parameters\Instances\EchoVaultFilter Instance", "Flags", 0x00010001, 0
+; Suppress automatic attachment. Loading the driver alone filters no volume;
+; a test or the application must explicitly attach the required volume.
+HKR, "Parameters\Instances\EchoVaultFilter Instance", "Flags", 0x00010001, 1
 
 [Strings]
 ProviderName = "EchoVault"

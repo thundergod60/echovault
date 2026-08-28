@@ -614,6 +614,27 @@ static NTSTATUS EvFilterUnload(_In_ FLT_FILTER_UNLOAD_FLAGS Flags)
     return STATUS_SUCCESS;
 }
 
+// Loading the driver must be harmless by itself.  Only an explicit manual
+// attachment (for example, to a disposable test VHD) is accepted.  This is
+// also enforced by the INF instance flag, but keeping the rule here means a
+// stale or hand-written service registration cannot silently attach us to
+// the Windows volume.
+static NTSTATUS EvInstanceSetup(
+    _In_ PCFLT_RELATED_OBJECTS FltObjects,
+    _In_ FLT_INSTANCE_SETUP_FLAGS Flags,
+    _In_ DEVICE_TYPE VolumeDeviceType,
+    _In_ FLT_FILESYSTEM_TYPE VolumeFilesystemType)
+{
+    UNREFERENCED_PARAMETER(FltObjects);
+    UNREFERENCED_PARAMETER(VolumeDeviceType);
+    UNREFERENCED_PARAMETER(VolumeFilesystemType);
+
+    if ((Flags & FLTFL_INSTANCE_SETUP_MANUAL_ATTACHMENT) == 0)
+        return STATUS_FLT_DO_NOT_ATTACH;
+
+    return STATUS_SUCCESS;
+}
+
 static FLT_PREOP_CALLBACK_STATUS EvPreCreate(
     _Inout_ PFLT_CALLBACK_DATA Data,
     _In_ PCFLT_RELATED_OBJECTS FltObjects,
@@ -633,7 +654,7 @@ CONST FLT_REGISTRATION EvRegistration = {
     NULL,                       // ContextRegistration
     EvCallbacks,                // OperationRegistration
     EvFilterUnload,             // FilterUnloadCallback
-    NULL,                       // InstanceSetup (attach to all volumes)
+    EvInstanceSetup,            // InstanceSetup (manual attachment only)
     NULL,                       // InstanceQueryTeardown
     NULL,                       // InstanceTeardownStart
     NULL,                       // InstanceTeardownComplete
