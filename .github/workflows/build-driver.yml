@@ -102,7 +102,7 @@ jobs:
           $sys = Join-Path $out 'EchoVaultFilter.sys'
           if (-not (Test-Path -LiteralPath $sys)) { throw 'MSBuild succeeded but EchoVaultFilter.sys is missing.' }
 
-          $tag = 'EVBUILD-SAFEUNLOAD-20260826'
+          $tag = 'EVBUILD-DOUBLEFREE-FIX-20260829'
           $ascii = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($sys))
           if (-not $ascii.Contains($tag)) { throw "The built driver does not contain expected tag $tag." }
 

@@ -122,7 +122,7 @@ typedef struct _EV_CONNECTION {
 // beyond doubt. Any .sys built before this tag does NOT contain the
 // string. Verify a downloaded driver with:
 //     findstr /c:"EVBUILD-SAFEUNLOAD-20260826" EchoVaultFilter.sys
-const char EvBuildTag[] = "EVBUILD-SAFEUNLOAD-20260826";
+const char EvBuildTag[] = "EVBUILD-DOUBLEFREE-FIX-20260829";
 
 // 2-second throttle: don't spam the guard with duplicate denies of
 // the same path (Explorer can retry opens rapidly).
@@ -130,7 +130,7 @@ const char EvBuildTag[] = "EVBUILD-SAFEUNLOAD-20260826";
 static WCHAR  gLastNotifyPath[EVFILTER_MAX_PATH];
 static ULONG  gLastNotifyTick = 0;
 
-#define EV_NOTIFY_TAG 'tfvE'
+#define EV_NOTIFY_TAG 'tnvE'     // PoolMon: Evnt (notification work item)
 
 typedef struct _EV_NOTIFY_CONTEXT {
     WORK_QUEUE_ITEM Wq;
@@ -281,7 +281,7 @@ static VOID EvQueueDenyNotification(const UNICODE_STRING* name, const WCHAR* app
 // custom descriptor that ALSO grants Authenticated Users, so the app's
 // own processes can connect while the gate still denies every other
 // opener (the file opens themselves are gated separately, per-path).
-#define EV_SD_TAG 'tfvE'
+#define EV_SD_TAG 'dsvE'         // PoolMon: Evsd (port security descriptor)
 
 static NTSTATUS EvBuildPortSecurityDescriptor(PSECURITY_DESCRIPTOR* OutSd)
 {
@@ -335,7 +335,8 @@ static NTSTATUS EvBuildPortSecurityDescriptor(PSECURITY_DESCRIPTOR* OutSd)
     if (!NT_SUCCESS(status)) goto done;
 
     *OutSd = sd;
-    sd = NULL;      // ownership transferred to the caller
+    sd = NULL;      // ownership of the descriptor transfers to the caller
+    acl = NULL;     // the returned absolute descriptor owns this DACL too
 
  done:
     if (acl)       ExFreePoolWithTag(acl, EV_SD_TAG);

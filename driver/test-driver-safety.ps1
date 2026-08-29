@@ -6,6 +6,15 @@ $inf = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'EchoVaultFilter.inf') 
 $control = Get-Content -LiteralPath (Join-Path $project 'filterctl\filterctl.c') -Raw
 $filterIo = Get-Content -LiteralPath (Join-Path $project 'filterio.cpp') -Raw
 
+$portSecurityBuilder = [regex]::Match(
+    $driver,
+    'static NTSTATUS EvBuildPortSecurityDescriptor[\s\S]*?(?=static VOID EvFreePortSecurityDescriptor)'
+).Value
+$allocationTags = [regex]::Matches(
+    $driver,
+    "(?m)^#define\s+EV_(?:POOL|NOTIFY|SD)_TAG\s+'([^']+)'"
+) | ForEach-Object { $_.Groups[1].Value }
+
 $failed = 0
 function Test-SafetyRule([bool]$Condition, [string]$Name) {
     if ($Condition) {
@@ -27,6 +36,13 @@ Test-SafetyRule ($driver -match 'FltSendMessage[\s\S]{0,250}&timeout') 'kernel-t
 Test-SafetyRule ($driver -match 'EVFILTER_ROLE_GUARD') 'notifications use a guard-only connection'
 Test-SafetyRule ($driver -match 'FltCloseClientPort') 'disconnect closes client ports'
 Test-SafetyRule ($driver -match 'RequestorMode\s*==\s*KernelMode') 'kernel-originated opens fail open'
+Test-SafetyRule (
+    $portSecurityBuilder -match '\*OutSd\s*=\s*sd;[\s\S]{0,200}sd\s*=\s*NULL;[\s\S]{0,200}acl\s*=\s*NULL;'
+) 'port descriptor transfers both descriptor and DACL ownership'
+Test-SafetyRule (
+    $allocationTags.Count -eq 3 -and
+    @($allocationTags | Sort-Object -Unique).Count -eq 3
+) 'entry, notification, and security-descriptor pool tags are distinct'
 Test-SafetyRule ($filterIo -match 'ULONGLONG\s+MessageId') 'message header uses the 64-bit Windows ABI'
 Test-SafetyRule ($filterIo -match 'FnGetMessage\)\(HANDLE, LPVOID, DWORD, LPOVERLAPPED\)') 'FilterGetMessage uses OVERLAPPED ABI'
 Test-SafetyRule ($filterIo -match 'EVFILTER_ROLE_GUARD') 'guard declares its connection role'
