@@ -66,7 +66,7 @@ jobs:
           $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
           New-Item -ItemType Directory -Path 'filterctl\bin\x64\Release' -Force | Out-Null
           $command = "`"$vcvars`" >nul && " +
-            "cl /nologo /O2 /W4 /TC filterctl\filterctl.c shell32.lib advapi32.lib " +
+            "cl /nologo /O2 /W4 filterctl\filterctl.c shell32.lib advapi32.lib " +
             "/Fe:filterctl\bin\x64\Release\filterctl.exe"
           cmd /d /s /c $command
           if ($LASTEXITCODE -ne 0) { throw "filterctl build failed with exit code $LASTEXITCODE." }
