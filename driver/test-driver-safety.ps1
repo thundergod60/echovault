@@ -47,6 +47,7 @@ Test-SafetyRule ($filterIo -match 'ULONGLONG\s+MessageId') 'message header uses 
 Test-SafetyRule ($filterIo -match 'FnGetMessage\)\(HANDLE, LPVOID, DWORD, LPOVERLAPPED\)') 'FilterGetMessage uses OVERLAPPED ABI'
 Test-SafetyRule ($filterIo -match 'EVFILTER_ROLE_GUARD') 'guard declares its connection role'
 Test-SafetyRule (($filterIo -notmatch 'FilterClose') -and ($control -notmatch 'FilterClose')) 'connection handles use CloseHandle'
+Test-SafetyRule ($control -match 'RunPersistentSelfTest' -and $control -match 'PORT_ALIVE_AT_END') 'persistent policy diagnostic keeps one port through all transitions'
 
 if ($failed -ne 0) {
     Write-Output "`n$failed safety rule(s) failed."

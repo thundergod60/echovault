@@ -6,6 +6,8 @@ on:
     branches: [main]
     paths:
       - 'driver/**'
+      - 'filterctl/**'
+      - 'filterstate.h'
       - 'shared/**'
       - 'packages.config'
       - 'Directory.Build.props'
@@ -54,6 +56,20 @@ jobs:
             "cl /nologo /O2 /W4 /I driver\stubcheck driver\stubcheck\test-evdevpath.c /Fe:test-evdevpath.exe && test-evdevpath.exe"
           cmd /d /s /c $command
           if ($LASTEXITCODE -ne 0) { throw "Driver logic tests failed with exit code $LASTEXITCODE." }
+
+      - name: Build persistent policy diagnostic
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw 'Visual Studio C++ tools were not found on the runner.' }
+          $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
+          New-Item -ItemType Directory -Path 'filterctl\bin\x64\Release' -Force | Out-Null
+          $command = "`"$vcvars`" >nul && " +
+            "cl /nologo /O2 /W4 /TC filterctl\filterctl.c shell32.lib advapi32.lib " +
+            "/Fe:filterctl\bin\x64\Release\filterctl.exe"
+          cmd /d /s /c $command
+          if ($LASTEXITCODE -ne 0) { throw "filterctl build failed with exit code $LASTEXITCODE." }
 
       - name: Build x64 Release driver
         shell: pwsh
@@ -107,6 +123,9 @@ jobs:
           if (-not $ascii.Contains($tag)) { throw "The built driver does not contain expected tag $tag." }
 
           $hash = (Get-FileHash -LiteralPath $sys -Algorithm SHA256).Hash.ToLowerInvariant()
+          $controller = Join-Path $env:GITHUB_WORKSPACE 'filterctl\bin\x64\Release\filterctl.exe'
+          if (-not (Test-Path -LiteralPath $controller)) { throw 'filterctl.exe is missing.' }
+          $controllerHash = (Get-FileHash -LiteralPath $controller -Algorithm SHA256).Hash.ToLowerInvariant()
           Set-Content -LiteralPath (Join-Path $out 'EchoVaultFilter.sys.sha256') `
             -Value "$hash  EchoVaultFilter.sys" -Encoding ascii
           @(
@@ -114,6 +133,8 @@ jobs:
             "run=$env:GITHUB_RUN_ID"
             "build_tag=$tag"
             "sha256=$hash"
+            "controller_sha256=$controllerHash"
+            'controller_test=persistent-policy-sequence'
             'start_type=SERVICE_DEMAND_START'
             'host_driver_loaded=false'
           ) | Set-Content -LiteralPath (Join-Path $out 'build-info.txt') -Encoding ascii
@@ -130,3 +151,4 @@ jobs:
             driver/bin/x64/Release/build-info.txt
             driver/bin/x64/Release/EchoVaultFilter.binlog
             driver/EchoVaultFilter.inf
+            filterctl/bin/x64/Release/filterctl.exe

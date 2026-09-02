@@ -24,6 +24,8 @@
 //   filterctl disable           panic off-switch: unload now + keep it
 //                               from loading until 'filterctl enable'
 //   filterctl enable            clear the off-switch
+//   filterctl selftest <path>   exercise every policy transition while
+//                               keeping one port connection open
 //
 // The crash-safety state (load/unload record, off-switch, unexpected-
 // shutdown detection) lives in filterstate.c — plain user mode, so
@@ -74,7 +76,116 @@ static void Usage(void)
         L"                             last shutdown)\n"
         L"  filterctl load [--force] [path-to-sys]   start the driver (admin)\n"
         L"  filterctl disable          panic off-switch: unload + keep unloaded\n"
-        L"  filterctl enable           clear the off-switch\n");
+        L"  filterctl enable           clear the off-switch\n"
+        L"  filterctl selftest <path>  run policy checks on a disposable file\n"
+        L"                             using one persistent connection\n");
+}
+
+// Sends one policy operation over an already-open control connection. Keeping
+// this helper independent of main lets the isolated guest exercise a complete
+// policy sequence without repeatedly opening and closing the minifilter port.
+static HRESULT SendPolicyMessage(
+    FnSend send,
+    HANDLE port,
+    ULONG opcode,
+    const wchar_t* value)
+{
+    EVFILTER_MSG msg;
+    memset(&msg, 0, sizeof(msg));
+    msg.OpCode = opcode;
+
+    if (value)
+    {
+        wcsncpy(msg.Path, value, EVFILTER_MAX_PATH - 1);
+        msg.Path[EVFILTER_MAX_PATH - 1] = L'\0';
+    }
+
+    DWORD pathBytes = (DWORD)((wcslen(msg.Path) + 1) * sizeof(WCHAR));
+    DWORD msgSize = (DWORD)(FIELD_OFFSET(EVFILTER_MSG, Path) + pathBytes);
+    DWORD returned = 0;
+    return send(port, &msg, msgSize, NULL, 0, &returned);
+}
+
+static int ExpectRead(const wchar_t* path, int shouldSucceed, const wchar_t* stage)
+{
+    SetLastError(ERROR_SUCCESS);
+    HANDLE file = CreateFileW(path, GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(file);
+        if (shouldSucceed)
+        {
+            wprintf(L"PASS %ls\n", stage);
+            return 1;
+        }
+        wprintf(L"FAIL %ls: read unexpectedly succeeded\n", stage);
+        return 0;
+    }
+
+    DWORD error = GetLastError();
+    if (!shouldSucceed && error == ERROR_ACCESS_DENIED)
+    {
+        wprintf(L"PASS %ls\n", stage);
+        return 1;
+    }
+    wprintf(L"FAIL %ls: CreateFile error %lu\n", stage, error);
+    return 0;
+}
+
+static int SelfTestSend(
+    FnSend send,
+    HANDLE port,
+    ULONG opcode,
+    const wchar_t* value,
+    const wchar_t* stage)
+{
+    HRESULT hr = SendPolicyMessage(send, port, opcode, value);
+    if (FAILED(hr))
+    {
+        wprintf(L"FAIL %ls: FilterSendMessage 0x%08lx\n",
+            stage, (unsigned long)hr);
+        return 0;
+    }
+    wprintf(L"PASS %ls\n", stage);
+    return 1;
+}
+
+static int RunPersistentSelfTest(FnSend send, HANDLE port, const wchar_t* path)
+{
+    wchar_t module[MAX_PATH];
+    DWORD moduleChars = GetModuleFileNameW(NULL, module, MAX_PATH);
+    if (moduleChars == 0 || moduleChars >= MAX_PATH)
+    {
+        wprintf(L"FAIL SELFTEST_MODULE_NAME: error %lu\n", GetLastError());
+        return 20;
+    }
+    const wchar_t* app = module;
+    for (DWORD i = 0; i < moduleChars; i++)
+        if (module[i] == L'\\') app = module + i + 1;
+
+    if (!SelfTestSend(send, port, EVFILTER_MSG_CLEAR, NULL, L"CLEAR_INITIAL")) return 21;
+    if (!SelfTestSend(send, port, EVFILTER_MSG_EXCLUDE_CLEAR, NULL, L"CLEAR_EXCLUSIONS_INITIAL")) return 22;
+    if (!SelfTestSend(send, port, EVFILTER_MSG_ADD, path, L"ADD")) return 23;
+    if (!ExpectRead(path, 0, L"DENY_AFTER_ADD")) return 24;
+    if (!SelfTestSend(send, port, EVFILTER_MSG_ALLOW, path, L"ALLOW")) return 25;
+    if (!ExpectRead(path, 1, L"READ_AFTER_ALLOW")) return 26;
+    if (!SelfTestSend(send, port, EVFILTER_MSG_DISALLOW, path, L"DISALLOW")) return 27;
+    if (!ExpectRead(path, 0, L"DENY_AFTER_DISALLOW")) return 28;
+    if (!SelfTestSend(send, port, EVFILTER_MSG_EXCLUDE_ADD, app, L"EXCLUDE_SELF")) return 29;
+    if (!ExpectRead(path, 1, L"READ_WHILE_EXCLUDED")) return 30;
+    if (!SelfTestSend(send, port, EVFILTER_MSG_EXCLUDE_REMOVE, app, L"UNEXCLUDE_SELF")) return 31;
+    if (!ExpectRead(path, 0, L"DENY_AFTER_UNEXCLUDE")) return 32;
+    if (!SelfTestSend(send, port, EVFILTER_MSG_REMOVE, path, L"REMOVE")) return 33;
+    if (!ExpectRead(path, 1, L"READ_AFTER_REMOVE")) return 34;
+    if (!SelfTestSend(send, port, EVFILTER_MSG_ADD, path, L"ADD_BEFORE_CLEAR")) return 35;
+    if (!SelfTestSend(send, port, EVFILTER_MSG_CLEAR, NULL, L"CLEAR_FINAL")) return 36;
+    if (!ExpectRead(path, 1, L"READ_AFTER_CLEAR")) return 37;
+    if (!SelfTestSend(send, port, EVFILTER_MSG_STATUS, NULL, L"PORT_ALIVE_AT_END")) return 38;
+
+    wprintf(L"PASS PERSISTENT_SELFTEST\n");
+    return 0;
 }
 
 // ---- small process runner (no console window) -------------------
@@ -541,6 +652,21 @@ int main(void)
         PrintError(L"FilterConnectCommunicationPort", hr);
         LocalFree(wargv);
         return 2;
+    }
+
+    if (wcscmp(verb, L"selftest") == 0)
+    {
+        if (nArgs < 3)
+        {
+            Usage();
+            CloseHandle(hPort);
+            LocalFree(wargv);
+            return 1;
+        }
+        int rc = RunPersistentSelfTest(pSend, hPort, wargv[2]);
+        CloseHandle(hPort);
+        LocalFree(wargv);
+        return rc;
     }
 
     // ---- Build the message ----
