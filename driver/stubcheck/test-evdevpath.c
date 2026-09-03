@@ -17,13 +17,40 @@
 
 // ---- Kernel function implementations (test doubles) -------------
 
+static void* gAllocations[64];
+static int gOutstanding = 0;
+static int gInvalidFree = 0;
+static int gFreeCalls = 0;
+static int gForceAllocFailure = 0;
+
 void* ExAllocatePool2(ULONG Flags, SIZE_T NumberOfBytes, ULONG Tag)
 {
     (void)Flags; (void)Tag;
-    return malloc(NumberOfBytes);
+    if (gForceAllocFailure || gOutstanding >= 64)
+        return NULL;
+    void* result = malloc(NumberOfBytes);
+    if (result)
+        gAllocations[gOutstanding++] = result;
+    return result;
 }
 
-void ExFreePool(void* P) { free(P); }
+void ExFreePool(void* P)
+{
+    // C free(NULL) would hide a kernel bug. Reject NULL, borrowed pointers,
+    // and double frees instead of delegating those invalid cases to libc.
+    for (int i = 0; P && i < gOutstanding; i++)
+    {
+        if (gAllocations[i] == P)
+        {
+            gAllocations[i] = gAllocations[--gOutstanding];
+            gFreeCalls++;
+            free(P);
+            return;
+        }
+    }
+    gInvalidFree++;
+    printf("FAIL  invalid kernel-pool free detected by test double\n");
+}
 
 // Fake symbolic-link resolution: any "\??\X:" maps to
 // "\Device\HarddiskVolume1" (21 WCHARs).
@@ -110,8 +137,7 @@ static void Check(const WCHAR* in, const WCHAR* expected)
         printf("ok    in=%-38ls -> %ls\n", in, got);
     }
 
-    if (out.Buffer != u.Buffer && out.Buffer)
-        ExFreePool(out.Buffer);
+    EvFreeDevicePath(&u, &out);
 }
 
 static void CheckNull(void)
@@ -144,6 +170,71 @@ static void CheckNull(void)
     }
 }
 
+static void CheckCleanup(void)
+{
+    UNICODE_STRING input, output;
+    int before = gFreeCalls;
+
+    // Real CLEAR/STATUS messages contain a NON-NULL pointer to an empty
+    // WCHAR string. This is distinct from the old empty.Buffer=NULL case.
+    RtlInitUnicodeString(&input, L"");
+    EvToDevicePath(&input, &output);
+    EvFreeDevicePath(&input, &output);
+    EvFreeDevicePath(&input, &output);
+    if (gFreeCalls != before || gInvalidFree || output.Buffer || output.Length)
+    {
+        gFail++;
+        printf("FAIL  non-NULL empty-string cleanup\n");
+    }
+    else printf("ok    non-NULL empty-string cleanup does not free NULL\n");
+
+    EvToDevicePath(NULL, &output);
+    EvFreeDevicePath(NULL, &output);
+    EvFreeDevicePath(NULL, NULL);
+    RtlInitUnicodeString(&input, L"relative.txt");
+    EvToDevicePath(&input, &output);
+    EvFreeDevicePath(&input, &output);
+    if (gFreeCalls != before || gInvalidFree)
+    {
+        gFail++;
+        printf("FAIL  NULL or borrowed-buffer cleanup\n");
+    }
+    else printf("ok    NULL and borrowed buffers are never freed\n");
+
+    RtlInitUnicodeString(&input, L"C:\\allocated.txt");
+    EvToDevicePath(&input, &output);
+    if (!output.Buffer || output.Buffer == input.Buffer)
+    {
+        gFail++;
+        printf("FAIL  expected allocated translation\n");
+    }
+    EvFreeDevicePath(&input, &output);
+    EvFreeDevicePath(&input, &output);
+    if (gFreeCalls != before + 1 || gOutstanding || gInvalidFree)
+    {
+        gFail++;
+        printf("FAIL  owned translation cleanup\n");
+    }
+    else printf("ok    owned translation freed exactly once\n");
+
+    before = gFreeCalls;
+    gForceAllocFailure = 1;
+    EvToDevicePath(&input, &output);
+    gForceAllocFailure = 0;
+    if (output.Buffer != input.Buffer)
+    {
+        gFail++;
+        printf("FAIL  allocation failure must borrow input\n");
+    }
+    EvFreeDevicePath(&input, &output);
+    if (gFreeCalls != before || gOutstanding || gInvalidFree)
+    {
+        gFail++;
+        printf("FAIL  allocation-failure cleanup\n");
+    }
+    else printf("ok    allocation failure does not free the input\n");
+}
+
 int main(void)
 {
     printf("EvToDevicePath tests\n");
@@ -167,6 +258,9 @@ int main(void)
     Check(L"\\\\.\\pipe\\name",         L"\\\\.\\pipe\\name");
 
     CheckNull();
+    CheckCleanup();
+    if (gOutstanding || gInvalidFree)
+        gFail++;
 
     if (gFail == 0)
     {

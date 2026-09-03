@@ -121,8 +121,8 @@ typedef struct _EV_CONNECTION {
 // Build tag, embedded in the .sys so CI artifacts can be told apart
 // beyond doubt. Any .sys built before this tag does NOT contain the
 // string. Verify a downloaded driver with:
-//     findstr /c:"EVBUILD-SAFEUNLOAD-20260826" EchoVaultFilter.sys
-const char EvBuildTag[] = "EVBUILD-DOUBLEFREE-FIX-20260829";
+//     findstr /c:"EVBUILD-EMPTY-PATH-FIX-20260903" EchoVaultFilter.sys
+const char EvBuildTag[] = "EVBUILD-EMPTY-PATH-FIX-20260903";
 
 // 2-second throttle: don't spam the guard with duplicate denies of
 // the same path (Explorer can retry opens rapidly).
@@ -483,6 +483,20 @@ static NTSTATUS EvMessageNotify(
         return status;
     }
 
+    // These commands have no path. Do not send an empty string through
+    // translation/cleanup: an empty translation has no owned allocation.
+    if (m->OpCode == EVFILTER_MSG_CLEAR)
+    {
+        ExAcquireFastMutex(&gLock);
+        evtClear(&gTable);
+        ExReleaseFastMutex(&gLock);
+        return STATUS_SUCCESS;
+    }
+    if (m->OpCode == EVFILTER_MSG_STATUS)
+        return STATUS_SUCCESS;
+    if (path.Length == 0)
+        return STATUS_INVALID_PARAMETER;
+
     // Translate path operations to the device form the gate compares
     // against (normalized names are \Device\... paths).  Do this only for
     // path operations; exclusion messages contain an executable base name.
@@ -496,14 +510,11 @@ static NTSTATUS EvMessageNotify(
         case EVFILTER_MSG_ALLOW:    status = EvMapStatus(evtAllow(&gTable, &devPath));    break;
         case EVFILTER_MSG_DISALLOW: status = EvMapStatus(evtDisallow(&gTable, &devPath)); break;
         case EVFILTER_MSG_REMOVE:   status = EvMapStatus(evtRemove(&gTable, &devPath));   break;
-        case EVFILTER_MSG_CLEAR:    evtClear(&gTable);                                    break;
-        case EVFILTER_MSG_STATUS:                                                         break;
         default:                    status = STATUS_INVALID_PARAMETER;                    break;
     }
     ExReleaseFastMutex(&gLock);
 
-    if (devPath.Buffer != path.Buffer)
-        ExFreePool(devPath.Buffer);
+    EvFreeDevicePath(&path, &devPath);
 
     return status;
 }

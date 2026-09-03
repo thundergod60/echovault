@@ -5,6 +5,7 @@ $driver = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'EchoVaultFilter.c')
 $inf = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'EchoVaultFilter.inf') -Raw
 $control = Get-Content -LiteralPath (Join-Path $project 'filterctl\filterctl.c') -Raw
 $filterIo = Get-Content -LiteralPath (Join-Path $project 'filterio.cpp') -Raw
+$devicePath = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'evdevpath.c') -Raw
 
 $portSecurityBuilder = [regex]::Match(
     $driver,
@@ -48,6 +49,14 @@ Test-SafetyRule ($filterIo -match 'FnGetMessage\)\(HANDLE, LPVOID, DWORD, LPOVER
 Test-SafetyRule ($filterIo -match 'EVFILTER_ROLE_GUARD') 'guard declares its connection role'
 Test-SafetyRule (($filterIo -notmatch 'FilterClose') -and ($control -notmatch 'FilterClose')) 'connection handles use CloseHandle'
 Test-SafetyRule ($control -match 'RunPersistentSelfTest' -and $control -match 'PORT_ALIVE_AT_END') 'persistent policy diagnostic keeps one port through all transitions'
+Test-SafetyRule ($driver -match 'EvFreeDevicePath\(&path, &devPath\)' -and $driver -notmatch 'ExFreePool\(devPath\.Buffer\)') 'message callback uses the tested path ownership cleanup'
+Test-SafetyRule ($devicePath -match 'if \(translated->Buffer &&') 'path cleanup refuses NULL pool frees'
+$messageHandler = [regex]::Match($driver, 'static NTSTATUS EvMessageNotify[\s\S]*?(?=// ---- Pre-op callback)').Value
+$translationIndex = $messageHandler.IndexOf('EvToDevicePath(&path, &devPath)')
+$pathlessClearIndex = $messageHandler.IndexOf('if (m->OpCode == EVFILTER_MSG_CLEAR)')
+$pathlessStatusIndex = $messageHandler.IndexOf('if (m->OpCode == EVFILTER_MSG_STATUS)')
+$emptyPathIndex = $messageHandler.IndexOf('if (path.Length == 0)')
+Test-SafetyRule ($pathlessClearIndex -ge 0 -and $pathlessClearIndex -lt $translationIndex -and $pathlessStatusIndex -ge 0 -and $pathlessStatusIndex -lt $translationIndex -and $emptyPathIndex -ge 0 -and $emptyPathIndex -lt $translationIndex) 'pathless commands and empty paths are handled before translation'
 
 if ($failed -ne 0) {
     Write-Output "`n$failed safety rule(s) failed."

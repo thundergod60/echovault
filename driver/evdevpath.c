@@ -20,8 +20,8 @@
 //   \\srv\sh\f.txt maps to \Device\Mup\srv\sh\f.txt
 // On ANY failure the path is used as-is (fail-open: an untranslated
 // path simply never matches). The result may point at 'in' (no free
-// needed) or at a buffer the caller must free with ExFreePool when it
-// differs from 'in'.
+// needed), NULL for empty input, or an allocated buffer. The caller must
+// use EvFreeDevicePath so empty results and borrowed strings are not freed.
 static VOID EvToDevicePath(const UNICODE_STRING* in, UNICODE_STRING* out)
 {
     out->Buffer = NULL;
@@ -125,4 +125,21 @@ static VOID EvToDevicePath(const UNICODE_STRING* in, UNICODE_STRING* out)
     // Unrecognized form (already a device path, mounted folder, etc.):
     // use it as-is. It may simply never match — that fails OPEN.
     *out = *in;
+}
+
+// ExFreePool, unlike C free(), requires an actual pool allocation. Both
+// the pointer and ownership must be checked: empty input produces NULL,
+// while failed/unneeded translation borrows the caller's buffer.
+static VOID EvFreeDevicePath(const UNICODE_STRING* original, UNICODE_STRING* translated)
+{
+    if (!translated)
+        return;
+    if (translated->Buffer &&
+        (!original || translated->Buffer != original->Buffer))
+    {
+        ExFreePool(translated->Buffer);
+    }
+    translated->Buffer = NULL;
+    translated->Length = 0;
+    translated->MaximumLength = 0;
 }
