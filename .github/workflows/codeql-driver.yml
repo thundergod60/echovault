@@ -75,6 +75,45 @@ jobs:
           category: /language:c-cpp/windows-driver
           output: codeql-results
 
+      - name: Require zero EchoVault-source CodeQL findings
+        if: always()
+        shell: pwsh
+        run: |
+          $sarifFiles = @(Get-ChildItem -LiteralPath codeql-results -Filter '*.sarif' -File -Recurse -ErrorAction SilentlyContinue)
+          if (-not $sarifFiles) {
+            throw 'CodeQL did not produce a SARIF result file.'
+          }
+
+          $findings = [Collections.Generic.List[object]]::new()
+          foreach ($sarifFile in $sarifFiles) {
+            $sarif = Get-Content -LiteralPath $sarifFile.FullName -Raw | ConvertFrom-Json
+            foreach ($run in @($sarif.runs)) {
+              foreach ($result in @($run.results)) {
+                $projectUri = @($result.locations | ForEach-Object {
+                  $_.physicalLocation.artifactLocation.uri
+                } | Where-Object {
+                  if (-not $_) { return $false }
+                  $normalized = [Uri]::UnescapeDataString(([string]$_).Replace('\', '/'))
+                  return $normalized -match '(?i)(^|/)(driver|shared)/'
+                } | Select-Object -First 1)
+                if ($projectUri) {
+                  $findings.Add([pscustomobject]@{
+                    Rule = [string]$result.ruleId
+                    Level = [string]$result.level
+                    File = [Uri]::UnescapeDataString([string]$projectUri[0])
+                    Message = [string]$result.message.text
+                  })
+                }
+              }
+            }
+          }
+
+          if ($findings.Count) {
+            $findings | Sort-Object File, Rule | Format-Table -AutoSize -Wrap
+            throw "Microsoft Windows-driver CodeQL found $($findings.Count) result(s) in EchoVault driver/shared source. Review and fix or explicitly justify every result before treating this workflow as green."
+          }
+          Write-Host 'Microsoft Windows-driver CodeQL reported zero findings in EchoVault driver/shared source.'
+
       - name: Upload readable CodeQL results
         if: always()
         uses: actions/upload-artifact@v4

@@ -90,10 +90,14 @@ for quick development you can also load it directly (below).
 - **Development:** enable test-signing once (admin):
   `bcdedit /set testsigning on` then **reboot**. With test-signing on,
   unsigned kernel drivers load.
-- **Production (free):** Microsoft **attestation signing** via Partner Center
-  — free, no $100 EV certificate needed for a driver you distribute directly
-  (EV signing is only required for Windows Update / WHQL distribution).
-  After attestation signing, users do NOT need test-signing mode.
+- **Production:** Microsoft **attestation signing** currently requires
+  Hardware Developer Program registration and an **EV code-signing
+  certificate**. Signing establishes package/publisher trust; it does not
+  test the driver or demonstrate that it is crash-free. Microsoft also notes
+  that attestation-signed drivers targeting retail users are not published
+  through Windows Update. Check the current Microsoft signing requirements
+  before choosing a release route:
+  <https://learn.microsoft.com/windows-hardware/drivers/dashboard/code-signing-attestation>
 
 ## Installing & loading (development)
 
@@ -289,5 +293,5 @@ protected process. The impact is bounded, though:
   (`ShellExecuteEx("notepad.exe", file)` launches Notepad with the file);
   the kernel capture is written and reviewed but must be compiled and
   VM-tested with the rest of the driver.
-- Remaining: optional exclusions (backup / indexer), and installation of
-  the attestation-signed driver by the setup program.
+- Remaining: optional exclusions (backup / indexer), and installation of a
+  properly production-signed driver by the setup program.

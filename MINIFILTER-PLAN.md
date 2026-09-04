@@ -68,12 +68,14 @@ current session's **unlock allow-list**; if not, the open is **denied**.
 - **Toolchain:** Visual Studio (2022 Community, free) + Windows Driver Kit (WDK).
   Kernel drivers cannot be built with the current MinGW toolchain — this is the
   one real requirement of the project.
-- **Signing:** attestation signing via Microsoft Partner Center is **free**
-  (the ~$100/yr EV cert is only needed for Windows Update/WHQL distribution —
-  not for handing out the driver directly).
+- **Signing:** Microsoft's current attestation-signing prerequisites include
+  Hardware Developer Program registration and an **EV code-signing
+  certificate**. Signing is a distribution requirement, not a stability test.
+  Microsoft currently says retail attestation packages are not published via
+  Windows Update; confirm the current release route before shipping.
 - **Dev/test machines:** enable test-signing (`bcdedit /set testsigning on`,
-  admin + reboot) during development; production builds use the attestation
-  signature (no test-signing mode needed for users).
+  admin + reboot) during development; release builds need an appropriate
+  Microsoft-accepted production signature (no test-signing mode for users).
 
 ## Failure modes & mitigations (the honest part)
 
@@ -100,8 +102,8 @@ current session's **unlock allow-list**; if not, the open is **denied**.
    + manual unlock via `--unlock` CLI. Proves the gate and the signing flow.
 2. **Phase 2 (product):** service + communication port + auto-prompt on deny +
    folder-level gate; integrate with existing unlock/re-lock/relock logic.
-3. **Phase 3 (release):** attestation-signed installer integration, Watcher
-   task awareness, README updates.
+3. **Phase 3 (release):** production-signed installer integration using the
+   then-current Microsoft route, Watcher task awareness, README updates.
 
 ## What does NOT change
 
@@ -126,8 +128,8 @@ current session's **unlock allow-list**; if not, the open is **denied**.
   Guard + watcher both self-heal via scheduled tasks. All best-effort
   no-ops when the driver is absent — verified (selftest passes, guard
   exits cleanly without the driver).
-- `driver/README-DRIVER.md` — build (VS + WDK), signing (test-signing for
-  dev, free attestation for release), install, safety analysis.
+- `driver/README-DRIVER.md` — build (VS + WDK), test-signing for development,
+  current production-signing requirements, install, safety analysis.
 
 **Phase 3 (app fidelity) written:** the deny notification now carries the
 requestor's image base name; the guard reopens the unlocked file in the SAME

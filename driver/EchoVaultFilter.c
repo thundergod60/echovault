@@ -71,17 +71,38 @@ static void EvtFreeKernel(void* p)
     ExFreePoolWithTag(p, EV_POOL_TAG);
 }
 
-static FAST_MUTEX gLock;
+// State-table comparisons use PASSIVE_LEVEL-only Unicode routines. ERESOURCE
+// leaves the caller's IRQL unchanged, unlike FAST_MUTEX (which raises it to
+// APC_LEVEL), while its critical-region helpers still prevent normal APCs.
+static ERESOURCE gLock;
 static EVT_ENTRY* gEntries[EV_MAX_ENTRIES];
 static EVT_TABLE  gTable;
 
 // App-exclusion list: image base names that may open locked files
 // (backup/indexer tools). Safe by construction — without the password
 // they only ever see ciphertext.
-static FAST_MUTEX      gExclLock;
+static ERESOURCE       gExclLock;
 static EVT_EXCL_TABLE  gExcl;
 
 static ULONG      gRandSeed   = 0xE601;
+
+_IRQL_requires_max_(APC_LEVEL)
+static VOID EvAcquireStateLock(_Inout_ PERESOURCE Resource)
+{
+    (void)ExEnterCriticalRegionAndAcquireResourceExclusive(Resource);
+}
+
+_IRQL_requires_max_(APC_LEVEL)
+static VOID EvReleaseStateLock(_Inout_ PERESOURCE Resource)
+{
+    ExReleaseResourceAndLeaveCriticalRegion(Resource);
+}
+
+static VOID EvDeleteStateLocks(VOID)
+{
+    ExDeleteResourceLite(&gExclLock);
+    ExDeleteResourceLite(&gLock);
+}
 
 // Maps the shared logic's status codes to NTSTATUS.
 static NTSTATUS EvMapStatus(int rc)
@@ -121,8 +142,8 @@ typedef struct _EV_CONNECTION {
 // Build tag, embedded in the .sys so CI artifacts can be told apart
 // beyond doubt. Any .sys built before this tag does NOT contain the
 // string. Verify a downloaded driver with:
-//     findstr /c:"EVBUILD-EMPTY-PATH-FIX-20260903" EchoVaultFilter.sys
-const char EvBuildTag[] = "EVBUILD-EMPTY-PATH-FIX-20260903";
+//     findstr /c:"EVBUILD-CODEQL-IRQL-FIX-20260904" EchoVaultFilter.sys
+const char EvBuildTag[] = "EVBUILD-CODEQL-IRQL-FIX-20260904";
 
 // 2-second throttle: don't spam the guard with duplicate denies of
 // the same path (Explorer can retry opens rapidly).
@@ -142,8 +163,8 @@ typedef struct _EV_NOTIFY_CONTEXT {
 // WCHAR buffer. Best-effort: on any failure the buffer stays empty, and
 // the guard then falls back to the default program (harmless).
 // Uses SeLocateProcessImageName (ntifs.h, pulled in by fltKernel.h) —
-// the current documented API. It must run at PASSIVE_LEVEL, which holds
-// for IRP_MJ_CREATE pre-operation callbacks.
+// the current documented API. It must run at PASSIVE_LEVEL. EvPreCreate
+// explicitly fails open before reaching this routine at any other IRQL.
 static VOID EvCaptureRequesterApp(PEPROCESS proc, WCHAR* out, ULONG outChars)
 {
     if (!proc || !out || outChars == 0)
@@ -177,7 +198,9 @@ static VOID EvCaptureRequesterApp(PEPROCESS proc, WCHAR* out, ULONG outChars)
     ExFreePool(imageName);
 }
 
-static VOID EvNotifyWorker(_In_ PVOID Context)
+WORKER_THREAD_ROUTINE EvNotifyWorker;
+
+VOID EvNotifyWorker(_In_ PVOID Context)
 {
     EV_NOTIFY_CONTEXT* c = (EV_NOTIFY_CONTEXT*)Context;
 
@@ -419,8 +442,10 @@ static VOID EvDisconnectNotify(_In_opt_ PVOID ConnectionCookie)
         if (gNotifyClient == connection->Port)
             gNotifyClient = NULL;
         gLastNotifyTick = 0;
-        FltCloseClientPort(gFilter, &connection->Port);
         ExReleaseFastMutex(&gPortLock);
+        // FltCloseClientPort requires PASSIVE_LEVEL. FAST_MUTEX raises IRQL
+        // to APC_LEVEL, so close only after releasing the port lock.
+        FltCloseClientPort(gFilter, &connection->Port);
     }
     else
     {
@@ -472,14 +497,14 @@ static NTSTATUS EvMessageNotify(
         m->OpCode == EVFILTER_MSG_EXCLUDE_REMOVE ||
         m->OpCode == EVFILTER_MSG_EXCLUDE_CLEAR)
     {
-        ExAcquireFastMutex(&gExclLock);
+        EvAcquireStateLock(&gExclLock);
         switch (m->OpCode)
         {
             case EVFILTER_MSG_EXCLUDE_ADD:    status = EvMapStatus(evtExclAdd(&gExcl, m->Path));    break;
             case EVFILTER_MSG_EXCLUDE_REMOVE: status = EvMapStatus(evtExclRemove(&gExcl, m->Path)); break;
             case EVFILTER_MSG_EXCLUDE_CLEAR:  evtExclClear(&gExcl);                                  break;
         }
-        ExReleaseFastMutex(&gExclLock);
+        EvReleaseStateLock(&gExclLock);
         return status;
     }
 
@@ -487,9 +512,9 @@ static NTSTATUS EvMessageNotify(
     // translation/cleanup: an empty translation has no owned allocation.
     if (m->OpCode == EVFILTER_MSG_CLEAR)
     {
-        ExAcquireFastMutex(&gLock);
+        EvAcquireStateLock(&gLock);
         evtClear(&gTable);
-        ExReleaseFastMutex(&gLock);
+        EvReleaseStateLock(&gLock);
         return STATUS_SUCCESS;
     }
     if (m->OpCode == EVFILTER_MSG_STATUS)
@@ -503,7 +528,7 @@ static NTSTATUS EvMessageNotify(
     UNICODE_STRING devPath;
     EvToDevicePath(&path, &devPath);
 
-    ExAcquireFastMutex(&gLock);
+    EvAcquireStateLock(&gLock);
     switch (m->OpCode)
     {
         case EVFILTER_MSG_ADD:      status = EvMapStatus(evtAdd(&gTable, &devPath));      break;
@@ -512,7 +537,7 @@ static NTSTATUS EvMessageNotify(
         case EVFILTER_MSG_REMOVE:   status = EvMapStatus(evtRemove(&gTable, &devPath));   break;
         default:                    status = STATUS_INVALID_PARAMETER;                    break;
     }
-    ExReleaseFastMutex(&gLock);
+    EvReleaseStateLock(&gLock);
 
     EvFreeDevicePath(&path, &devPath);
 
@@ -538,15 +563,21 @@ static FLT_PREOP_CALLBACK_STATUS EvPreCreate(
     if (Data->RequestorMode == KernelMode)
         return FLT_PREOP_SUCCESS_NO_CALLBACK;
 
+    // A pre-create callback can run at APC_LEVEL. The path-table comparison
+    // and requester-image lookup use documented PASSIVE_LEVEL-only routines,
+    // so fail open before doing either operation at a raised IRQL.
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL)
+        return FLT_PREOP_SUCCESS_NO_CALLBACK;
+
     PFLT_FILE_NAME_INFORMATION nameInfo = NULL;
     NTSTATUS status = FltGetFileNameInformation(Data,
         FLT_FILE_NAME_NORMALIZED | FLT_FILE_NAME_QUERY_DEFAULT, &nameInfo);
     if (!NT_SUCCESS(status))
         return FLT_PREOP_SUCCESS_NO_CALLBACK;   // fail-open
 
-    ExAcquireFastMutex(&gLock);
+    EvAcquireStateLock(&gLock);
     BOOLEAN allowed = evtIsAllowed(&gTable, &nameInfo->Name);
-    ExReleaseFastMutex(&gLock);
+    EvReleaseStateLock(&gLock);
 
     if (!allowed)
     {
@@ -563,9 +594,9 @@ static FLT_PREOP_CALLBACK_STATUS EvPreCreate(
         // backup tool from copying the encrypted file).
         if (requesterApp[0])
         {
-            ExAcquireFastMutex(&gExclLock);
+            EvAcquireStateLock(&gExclLock);
             BOOLEAN excluded = evtExclCheck(&gExcl, requesterApp);
-            ExReleaseFastMutex(&gExclLock);
+            EvReleaseStateLock(&gExclLock);
             if (excluded)
                 allowed = TRUE;
         }
@@ -608,21 +639,24 @@ static NTSTATUS EvFilterUnload(_In_ FLT_FILTER_UNLOAD_FLAGS Flags)
     }
     ExWaitForRundownProtectionRelease(&gNotifyRundown);
 
-    ExAcquireFastMutex(&gLock);
-    evtClear(&gTable);
-    ExReleaseFastMutex(&gLock);
-
-    ExAcquireFastMutex(&gExclLock);
-    evtExclClear(&gExcl);
-    ExReleaseFastMutex(&gExclLock);
-
     if (gFilter)
     {
         // FltMgr closes existing client connections during unregister and
-        // invokes EvDisconnectNotify while gFilter is still valid.
+        // invokes EvDisconnectNotify while gFilter is still valid. It also
+        // drains callbacks before the state tables and locks are destroyed.
         FltUnregisterFilter(gFilter);
         gFilter = NULL;
     }
+
+    EvAcquireStateLock(&gLock);
+    evtClear(&gTable);
+    EvReleaseStateLock(&gLock);
+
+    EvAcquireStateLock(&gExclLock);
+    evtExclClear(&gExcl);
+    EvReleaseStateLock(&gExclLock);
+
+    EvDeleteStateLocks();
     return STATUS_SUCCESS;
 }
 
@@ -680,6 +714,8 @@ CONST FLT_REGISTRATION EvRegistration = {
 
 // ---- Entry point -----------------------------------------------
 
+DRIVER_INITIALIZE DriverEntry;
+
 NTSTATUS
 DriverEntry(
     _In_ PDRIVER_OBJECT  DriverObject,
@@ -687,8 +723,17 @@ DriverEntry(
 {
     UNREFERENCED_PARAMETER(RegistryPath);
 
-    ExInitializeFastMutex(&gLock);
-    ExInitializeFastMutex(&gExclLock);
+    NTSTATUS status = ExInitializeResourceLite(&gLock);
+    if (!NT_SUCCESS(status))
+        return status;
+
+    status = ExInitializeResourceLite(&gExclLock);
+    if (!NT_SUCCESS(status))
+    {
+        ExDeleteResourceLite(&gLock);
+        return status;
+    }
+
     ExInitializeFastMutex(&gPortLock);
     ExInitializeRundownProtection(&gNotifyRundown);
     gExcl.count = 0;
@@ -708,9 +753,12 @@ DriverEntry(
     if (gTable.epoch == 0)
         gTable.epoch = 1;
 
-    NTSTATUS status = FltRegisterFilter(DriverObject, &EvRegistration, &gFilter);
+    status = FltRegisterFilter(DriverObject, &EvRegistration, &gFilter);
     if (!NT_SUCCESS(status))
+    {
+        EvDeleteStateLocks();
         return status;
+    }
 
     PSECURITY_DESCRIPTOR sd = NULL;
     status = EvBuildPortSecurityDescriptor(&sd);
@@ -718,6 +766,7 @@ DriverEntry(
     {
         FltUnregisterFilter(gFilter);
         gFilter = NULL;
+        EvDeleteStateLocks();
         return status;
     }
 
@@ -744,6 +793,7 @@ DriverEntry(
     {
         FltUnregisterFilter(gFilter);
         gFilter = NULL;
+        EvDeleteStateLocks();
         return status;
     }
 
@@ -754,6 +804,7 @@ DriverEntry(
         gServerPort = NULL;
         FltUnregisterFilter(gFilter);
         gFilter = NULL;
+        EvDeleteStateLocks();
         return status;
     }
 

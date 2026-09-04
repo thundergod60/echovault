@@ -11,6 +11,14 @@ $portSecurityBuilder = [regex]::Match(
     $driver,
     'static NTSTATUS EvBuildPortSecurityDescriptor[\s\S]*?(?=static VOID EvFreePortSecurityDescriptor)'
 ).Value
+$disconnectHandler = [regex]::Match(
+    $driver,
+    'static VOID EvDisconnectNotify[\s\S]*?(?=static NTSTATUS EvMessageNotify)'
+).Value
+$preCreateHandler = [regex]::Match(
+    $driver,
+    'static FLT_PREOP_CALLBACK_STATUS EvPreCreate\([\s\S]*?(?=static NTSTATUS EvFilterUnload)'
+).Value
 $allocationTags = [regex]::Matches(
     $driver,
     "(?m)^#define\s+EV_(?:POOL|NOTIFY|SD)_TAG\s+'([^']+)'"
@@ -37,6 +45,14 @@ Test-SafetyRule ($driver -match 'FltSendMessage[\s\S]{0,250}&timeout') 'kernel-t
 Test-SafetyRule ($driver -match 'EVFILTER_ROLE_GUARD') 'notifications use a guard-only connection'
 Test-SafetyRule ($driver -match 'FltCloseClientPort') 'disconnect closes client ports'
 Test-SafetyRule ($driver -match 'RequestorMode\s*==\s*KernelMode') 'kernel-originated opens fail open'
+Test-SafetyRule ($driver -match 'static ERESOURCE\s+gLock' -and $driver -match 'static ERESOURCE\s+gExclLock') 'Unicode state tables use IRQL-preserving ERESOURCE locks'
+Test-SafetyRule ($driver -notmatch 'Ex(?:Initialize|Acquire|Release)FastMutex\(&g(?:Lock|ExclLock)\)') 'state-table locks never raise IRQL with FAST_MUTEX'
+Test-SafetyRule ($preCreateHandler -match 'KeGetCurrentIrql\(\)\s*!=\s*PASSIVE_LEVEL') 'pre-create fails open before PASSIVE_LEVEL-only operations at raised IRQL'
+Test-SafetyRule (
+    $disconnectHandler.IndexOf('ExReleaseFastMutex(&gPortLock)') -ge 0 -and
+    $disconnectHandler.IndexOf('FltCloseClientPort') -gt $disconnectHandler.IndexOf('ExReleaseFastMutex(&gPortLock)')
+) 'disconnect closes the client port only after releasing the fast mutex'
+Test-SafetyRule ($driver -match 'DRIVER_INITIALIZE\s+DriverEntry' -and $driver -match 'WORKER_THREAD_ROUTINE\s+EvNotifyWorker') 'CodeQL function-role declarations cover entry and work-item callbacks'
 Test-SafetyRule (
     $portSecurityBuilder -match '\*OutSd\s*=\s*sd;[\s\S]{0,200}sd\s*=\s*NULL;[\s\S]{0,200}acl\s*=\s*NULL;'
 ) 'port descriptor transfers both descriptor and DACL ownership'

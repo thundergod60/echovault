@@ -268,13 +268,16 @@ it will actually occupy ~15-20 GB.
   `sc config EchoVaultFilter start= demand`, then
   `sc delete EchoVaultFilter` from Safe Mode.
 
-## Part E — Production signing (free) — only if you ship the driver
+## Part E — Production signing — only if you ship the driver
 
-- Microsoft **attestation signing** via Partner Center is free and does NOT
-  need the $100 EV certificate. After signing, users load the driver
-  WITHOUT test-signing mode.
-- Details: search "attestation signing kernel driver" on Microsoft's
-  driver-signing docs (or ask me for a step-by-step when you get there).
+- Signing proves package/publisher identity; it is not a stability test and
+  does not replace CodeQL, Driver Verifier, or HLK testing.
+- Microsoft's current attestation-signing prerequisites include Hardware
+  Developer Program registration and an **EV code-signing certificate**.
+  Attestation-signed drivers aimed at retail users are not published through
+  Windows Update; use the current Microsoft documentation when choosing the
+  eventual distribution route.
+- Details: <https://learn.microsoft.com/windows-hardware/drivers/dashboard/code-signing-attestation>
 
 ---
 
