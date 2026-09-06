@@ -23,6 +23,10 @@
 
 #include <windows.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // Marker flags
 #define EVFS_OPTS_LOADED    0x01   // a load was recorded
 #define EVFS_OPTS_UNLOADED  0x02   // a clean unload was recorded
@@ -64,5 +68,9 @@ int  EvFsUnexpectedShutdownSince(ULONGLONG since, ULONGLONG* whenOut);
 // buf. driverLoaded tells it whether the driver port is reachable
 // right now. Returns 1 on success.
 int  EvFsBuildReport(wchar_t* buf, size_t cap, int driverLoaded);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif // FILTERSTATE_H

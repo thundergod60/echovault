@@ -35,7 +35,7 @@ jobs:
           $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
           if (-not $vs) { throw 'Microsoft C++ compiler not found.' }
           $setup = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
-          $command = '"' + $setup + '" && cl /nologo /std:c++17 /EHsc /W4 /O2 /MT /utf-8 /Fe:EchoVault.exe main.cpp ui.cpp vault.cpp security.cpp filterio.cpp filterstate.c /link /SUBSYSTEM:WINDOWS bcrypt.lib comdlg32.lib shell32.lib ole32.lib oleaut32.lib advapi32.lib user32.lib gdi32.lib'
+          $command = '"' + $setup + '" && cl /nologo /std:c++17 /EHsc /W4 /O2 /MT /utf-8 /Fe:EchoVault.exe main.cpp ui.cpp vault.cpp security.cpp filterio.cpp filterstate.c /link /SUBSYSTEM:WINDOWS bcrypt.lib comdlg32.lib shell32.lib ole32.lib oleaut32.lib taskschd.lib advapi32.lib user32.lib gdi32.lib'
           & $env:ComSpec /d /s /c $command
           if ($LASTEXITCODE -ne 0) { throw 'App compilation failed.' }
       - name: Test only disposable files (no installation or driver loading)
