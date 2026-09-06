@@ -14,7 +14,7 @@ struct PasswordAnswer {
 
 // --- Main-menu actions ---
 
-enum class MenuAction { Add, Remove, ChangeFilePw, ChangeMasterPw, Exit };
+enum class MenuAction { Add, Remove, ChangeFilePw, ChangeMasterPw, Setup, Open, Exit };
 
 // Shows the custom file/folder selection dialog.
 // Returns an empty path if cancelled.
@@ -23,33 +23,32 @@ std::filesystem::path SelectTarget();
 // Installs Windows Explorer right-click context menu hooks in the registry.
 bool InstallRegistryHooks();
 
-// --- Open interception (auto-unlock on double-click) ---
+// Repairs only hazardous script associations previously owned by EchoVault.
+// Leaves every unrelated user choice unchanged.
+bool RepairScriptAssociations();
 
-// Shows the install/uninstall dialog for open interception.
+// --- Optional, user-controlled Explorer integration ---
+
+// Shows setup/status and offers Windows Default Apps.
 void ManageOpenInterception();
 
-// Registers EchoVault as the default handler for common extensions,
-// backing up the original handlers first. Silent; returns success.
+// Registers an AVAILABLE handler; Windows defaults are left to the user.
 bool InstallOpenInterception();
 
-// Restores the original handlers and removes all EchoVault data.
+// Removes integration entries, not encrypted files or the vault database.
 bool UninstallOpenInterception();
 
 bool IsOpenInterceptionInstalled();
 
-// Adds/removes an extension (e.g. ".py") to the interception list and
-// re-applies the interception so it takes effect immediately.
+// Adds/removes an extension as a candidate in Windows Default Apps.
 bool AddOpenInterceptionExt(const std::wstring& ext);
 bool RemoveOpenInterceptionExt(const std::wstring& ext);
 
-// Makes sure an extension is intercepted (mapped to EchoVaultOpen, its
-// UserChoice override removed). Called automatically whenever a file is
-// encrypted, so ANY file type gets covered on the spot. Idempotent.
+// Registers a file type only when Explorer integration was explicitly enabled.
+// Does not change the chosen default or start a background process.
 void EnsureExtensionIntercepted(const std::wstring& ext);
 
-// Deletes any "Open with" UserChoice override for every extension
-// EchoVault has taken over. Called by the watcher and at the start of
-// every --open, so the mapping self-heals even if the watcher is down.
+// Compatibility name: refreshes a status report; never writes UserChoice.
 void ReassertInterception();
 
 // Opens a file with the program associated with it before interception
@@ -66,13 +65,8 @@ unsigned long OpenWithOriginalApp(const std::filesystem::path& filePath,
 
 // --- Background association watcher ---
 //
-// When a user picks another app via "Open with", Windows writes a
-// UserChoice key that overrides the extension's default handler, so the
-// NEXT double-click would bypass EchoVault entirely. The watcher (a tiny
-// hidden-window process, ~0% CPU when idle) re-asserts our mapping: it
-// reacts to shell association-change notifications and also does a
-// low-frequency sweep, deleting UserChoice overrides for every extension
-// EchoVault has taken over.
+// Compatibility mode only: refreshes association-status.txt every 30 seconds.
+// Never changes defaults. Normal builds do not auto-start or schedule it.
 
 // Starts the watcher process if it isn't already running. No-op otherwise.
 bool StartAssocWatcher();

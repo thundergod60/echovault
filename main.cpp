@@ -31,6 +31,7 @@ std::vector<unsigned char> GetMasterKeyOnDemand()
 {
     if (g_MasterKey.empty())
     {
+        if (IsFirstRun() && !FirstRunWizard()) return {};
         g_MasterKey = Authenticate();
     }
     return g_MasterKey;
@@ -57,39 +58,27 @@ static void HandleUnlockAndOpen(const std::filesystem::path& target,
         return;
     }
 
-    unsigned long pid = OpenWithOriginalApp(target, requesterApp);
-
-    // Wait for the viewer we launched to close.
-    if (pid)
-    {
-        HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, pid);
-        if (h)
-        {
-            WaitForSingleObject(h, INFINITE);
-            CloseHandle(h);
-        }
+    OpenWithOriginalApp(target, requesterApp);
+    // Editors may reuse an existing process. A launcher PID is not evidence
+    // that the document has closed; relock only after explicit confirmation.
+    MessageBoxW(nullptr,
+        (L"The file is now UNLOCKED in its original location:\n" + target.wstring() +
+         L"\n\nSave and close the document in its app, then return here and press OK to lock it again. "
+         L"Do not shut down or close EchoVault while this file is unlocked. "
+         L"If EchoVault or Windows stops, the file can remain unencrypted.").c_str(),
+        L"EchoVault - Save and close, then lock", MB_OK | MB_ICONWARNING);
+    while (!RelockFile(target, unlock)) {
+        if (MessageBoxW(nullptr,
+            (L"Could not lock this file. It is still UNENCRYPTED:\n" + target.wstring() +
+             L"\n\nClose apps using it and check free disk space. Retry to try locking again. "
+             L"Cancel leaves it unencrypted; use Encrypt in EchoVault afterward.").c_str(),
+            L"EchoVault - File still unlocked", MB_RETRYCANCEL | MB_ICONERROR) != IDRETRY) break;
     }
-
-    // Re-lock. Retry while the file is still held open by another
-    // program (e.g. an existing instance of the viewer).
-    bool relocked = false;
-    for (int attempt = 0; attempt < 40; attempt++)
-    {
-        if (RelockFile(target, unlock)) { relocked = true; break; }
-        Sleep(3000);
+    if (IsEncrypted(target)) {
+        EvDenyFor(target.wstring());
+        ShowInfo(L"EchoVault", L"The file is encrypted again.");
     }
-    if (relocked)
-    {
-        EvDenyFor(target.wstring());   // driver: re-gate the path
-    }
-    else
-    {
-        ShowError(L"EchoVault",
-            (L"Could not re-lock the file. It is currently UNPROTECTED:\n" +
-             target.wstring() +
-             L"\n\nClose every program using it, then run EchoVault on it\n"
-             L"again from the right-click menu to encrypt it.").c_str());
-    }
+    SecureZeroMemory(unlock.fileKey.data(), unlock.fileKey.size());
 }
 
 // ---- Guard service (EchoVault.exe --guard) ----------------------
@@ -143,10 +132,14 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
         {
             if (argc >= 2 && wcscmp(argv[1], L"--selftest") == 0)
             {
-                int rc = RunSelfTest();
+                int rc = RunSelfTest(argc >= 3 ? std::filesystem::path(argv[2]) : std::filesystem::path{});
                 LocalFree(argv);
                 Shutdown();
                 return rc;
+            }
+            if (argc >= 2 && wcscmp(argv[1], L"--uninstall-open") == 0) {
+                bool ok = UninstallOpenInterception();
+                LocalFree(argv); Shutdown(); return ok ? 0 : 1;
             }
             if (argc >= 2 && wcscmp(argv[1], L"--watch") == 0)
             {
@@ -187,22 +180,21 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
         }
     }
 
-    // ---- First run: create password & recovery key ----
-    if (IsFirstRun())
-    {
-        if (!FirstRunWizard())
-        {
-            Shutdown();
-            return 0;
-        }
-
-        // Zero-config setup: install the right-click menu and the open
-        // interception (with its background watcher) automatically, so the
-        // user never has to manage them. Both are idempotent and can be
-        // removed later with EchoVault.exe --uninstall-open.
-        InstallRegistryHooks();
-        InstallOpenInterception();
+    if (!RepairScriptAssociations()) {
+        ShowError(L"EchoVault",
+            L"Windows blocked EchoVault from fully repairing an old .bat or .cmd "
+            L"association. Use Windows Default Apps reset or ask for the manual "
+            L"repair steps before opening scripts.");
     }
+
+    // Serialize interactive mutations, but leave the read-only watcher separate.
+    HANDLE interactive = CreateMutexW(nullptr, FALSE, L"Local\\EchoVaultInteractive");
+    if (!interactive || GetLastError() == ERROR_ALREADY_EXISTS) {
+        ShowInfo(L"EchoVault", L"EchoVault is already working. Return to its open dialog, finish locking the file, then try again.");
+        if (interactive) CloseHandle(interactive);
+        Shutdown(); return 1;
+    }
+    struct MutexHandle { HANDLE h; ~MutexHandle() { CloseHandle(h); } } ownership{interactive};
 
     // ---- CLI Arguments Parsing (Smart Context Menu + Open Interception) ----
     int argc = 0;
@@ -215,15 +207,10 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
         {
             std::filesystem::path target = argv[2];
 
-            // Self-heal: if the user (or Windows) set an "Open with"
-            // override since we last ran, delete it now so the NEXT
-            // double-click is intercepted again. Cheap and idempotent.
+            // Refresh the association report; never change Windows defaults.
             ReassertInterception();
 
-            // A double-click is the exact moment the watcher matters, so
-            // revive it here too if it was ever killed: a mutex check, and
-            // a spawn only when it is actually missing.
-            StartAssocWatcher();
+
 
             if (std::filesystem::exists(target))
             {
@@ -299,6 +286,16 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
         LocalFree(argv);
     }
 
+    if (IsFirstRun()) {
+        if (!FirstRunWizard()) { Shutdown(); return 0; }
+        ManageOpenInterception();
+    }
+    else if (IsOpenInterceptionInstalled()) {
+        // Refresh registrations created by earlier betas (which exposed only
+        // .txt). This never changes the user's Windows default choices.
+        InstallOpenInterception();
+    }
+
     // ---- Main loop ----
     for (;;)
     {
@@ -307,7 +304,18 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
         if (action == MenuAction::Exit)
             break;
 
-        if (action == MenuAction::Add)
+        if (action == MenuAction::Setup) {
+            ManageOpenInterception();
+        }
+        else if (action == MenuAction::Open) {
+            auto target = SelectTarget();
+            if (!target.empty()) {
+                if (std::filesystem::is_directory(target)) DecryptTarget(target);
+                else if (IsEncrypted(target)) HandleUnlockAndOpen(target);
+                else OpenWithOriginalApp(target);
+            }
+        }
+        else if (action == MenuAction::Add)
         {
             auto target = SelectTarget();
             if (!target.empty())
@@ -491,7 +499,7 @@ static std::vector<unsigned char> HandleForgotPassword(VaultHeader& hdr)
 
     auto newHash = HashPassword(newPw, newSalt);
     auto newKey  = DeriveKey(newPw, newSalt);
-    auto newEnc  = EncryptBuffer(masterKey, newKey);
+    auto newEnc  = EncryptAuthenticated(masterKey, newKey);
 
     if (newHash.empty() || newKey.empty() || newEnc.size() != 64) {
         ShowError(L"EchoVault", L"Failed to re-encrypt with new password.");

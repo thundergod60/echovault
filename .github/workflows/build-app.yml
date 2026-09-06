@@ -1,0 +1,86 @@
+name: Build driver-free EchoVault app
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '*.cpp'
+      - '*.h'
+      - 'filterstate.c'
+      - 'tests/**'
+      - 'installer.iss'
+      - 'readme.txt'
+      - 'RELEASE-NOTES.md'
+      - '.github/workflows/build-app.yml'
+  pull_request:
+    paths:
+      - '*.cpp'
+      - '*.h'
+      - 'filterstate.c'
+      - 'tests/**'
+      - 'installer.iss'
+      - '.github/workflows/build-app.yml'
+permissions:
+  contents: read
+jobs:
+  app:
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build with Microsoft C++ (no driver)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw 'Microsoft C++ compiler not found.' }
+          $setup = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
+          $command = '"' + $setup + '" && cl /nologo /std:c++17 /EHsc /W4 /O2 /MT /utf-8 /Fe:EchoVault.exe main.cpp ui.cpp vault.cpp security.cpp filterio.cpp filterstate.c /link /SUBSYSTEM:WINDOWS bcrypt.lib comdlg32.lib shell32.lib ole32.lib oleaut32.lib advapi32.lib user32.lib gdi32.lib'
+          & $env:ComSpec /d /s /c $command
+          if ($LASTEXITCODE -ne 0) { throw 'App compilation failed.' }
+      - name: Test only disposable files (no installation or driver loading)
+        shell: pwsh
+        run: ./tests/test-app.ps1 -ReportDirectory "$env:RUNNER_TEMP\EchoVault-app-tests"
+      - name: Build per-user installer
+        shell: pwsh
+        run: |
+          $candidates = @("${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "${env:ProgramFiles(x86)}\Inno Setup 7\ISCC.exe")
+          $compiler = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          if (-not $compiler) { throw 'Inno Setup compiler not found on runner.' }
+          & $compiler installer.iss
+          if ($LASTEXITCODE -ne 0) { throw 'Installer compilation failed.' }
+      - name: Prepare release files and checksums
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Path release -Force | Out-Null
+          Copy-Item EchoVault.exe, readme.txt, RELEASE-NOTES.md -Destination release
+          Compress-Archive -Path release/* -DestinationPath EchoVault-1.1.0-beta.1-portable-x64.zip
+          $files = @(
+            'output/EchoVault-1.1.0-beta.1-Setup.exe',
+            'EchoVault-1.1.0-beta.1-portable-x64.zip'
+          )
+          $lines = foreach ($file in $files) {
+            $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash *$([IO.Path]::GetFileName($file))"
+          }
+          $lines | Set-Content -LiteralPath SHA256SUMS.txt -Encoding ascii
+      - name: Upload app only
+        uses: actions/upload-artifact@v4
+        with:
+          name: EchoVault-driver-free-x64
+          path: |
+            EchoVault.exe
+            readme.txt
+            RELEASE-NOTES.md
+            output/EchoVault-1.1.0-beta.1-Setup.exe
+            EchoVault-1.1.0-beta.1-portable-x64.zip
+            SHA256SUMS.txt
+          if-no-files-found: error
+      - name: Upload copyable test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: EchoVault-app-test-report
+          path: ${{ runner.temp }}/EchoVault-app-tests/selftest.log
+          if-no-files-found: warn

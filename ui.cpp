@@ -36,6 +36,8 @@
 #define IDC_MENU_CHANGE_FILE  203
 #define IDC_MENU_CHANGE_MASTER 204
 #define IDC_MENU_EXIT         206
+#define IDC_MENU_SETUP        207
+#define IDC_MENU_OPEN         208
 
 #define IDC_SEL_FILE          301
 #define IDC_SEL_FOLDER        302
@@ -499,9 +501,13 @@ static LRESULT CALLBACK MenuDlgProc(
                   BS_PUSHBUTTON | WS_TABSTOP, 0,
                   60, 177, 200, 32,  IDC_MENU_CHANGE_MASTER);
 
+        MakeChild(hwnd, L"BUTTON", L"&Open encrypted file",
+                  BS_PUSHBUTTON | WS_TABSTOP, 0, 60, 214, 200, 32, IDC_MENU_OPEN);
+        MakeChild(hwnd, L"BUTTON", L"Explorer &setup and status",
+                  BS_PUSHBUTTON | WS_TABSTOP, 0, 60, 251, 200, 32, IDC_MENU_SETUP);
         MakeChild(hwnd, L"BUTTON", L"Exit",
                   BS_PUSHBUTTON | WS_TABSTOP, 0,
-                  60, 214, 200, 32,  IDC_MENU_EXIT);
+                  60, 288, 200, 32,  IDC_MENU_EXIT);
         return 0;
     }
 
@@ -524,6 +530,10 @@ static LRESULT CALLBACK MenuDlgProc(
             d->action = MenuAction::ChangeMasterPw;
             DestroyWindow(hwnd);
             break;
+        case IDC_MENU_SETUP:
+            d->action = MenuAction::Setup; DestroyWindow(hwnd); break;
+        case IDC_MENU_OPEN:
+            d->action = MenuAction::Open; DestroyWindow(hwnd); break;
         case IDC_MENU_EXIT:
             d->action = MenuAction::Exit;
             DestroyWindow(hwnd);
@@ -555,7 +565,7 @@ MenuAction ShowMainMenu()
     }
 
     MenuDlgData data;
-    RECT rc = { 0, 0, 320, 280 };
+    RECT rc = { 0, 0, 320, 345 };
     AdjustWindowRectEx(&rc, WS_POPUP | WS_CAPTION | WS_SYSMENU,
                        FALSE, WS_EX_DLGMODALFRAME);
 
@@ -723,22 +733,26 @@ bool InstallRegistryHooks()
         if (RegCreateKeyExW(HKEY_CURRENT_USER, subKey, 0, nullptr,
             REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &hKey, nullptr) == ERROR_SUCCESS)
         {
-            RegSetValueExW(hKey, valName, 0, REG_SZ,
+            LONG status = RegSetValueExW(hKey, valName, 0, REG_SZ,
                 reinterpret_cast<const BYTE*>(valData.c_str()),
                 static_cast<DWORD>((valData.size() + 1) * sizeof(wchar_t)));
             RegCloseKey(hKey);
-            return true;
+            return status == ERROR_SUCCESS;
         }
         return false;
     };
 
     // Add for all files (*)
-    writeReg(L"Software\\Classes\\*\\shell\\EchoVault", nullptr, L"EchoVault (Lock/Unlock)");
-    writeReg(L"Software\\Classes\\*\\shell\\EchoVault\\command", nullptr, commandStr);
+    bool ok = writeReg(L"Software\\Classes\\*\\shell\\EchoVault", nullptr, L"EchoVault (Lock/Unlock)");
+    ok = writeReg(L"Software\\Classes\\*\\shell\\EchoVault\\command", nullptr, commandStr) && ok;
 
     // Add for directories
-    writeReg(L"Software\\Classes\\Directory\\shell\\EchoVault", nullptr, L"EchoVault (Lock/Unlock)");
-    writeReg(L"Software\\Classes\\Directory\\shell\\EchoVault\\command", nullptr, commandStr);
+    ok = writeReg(L"Software\\Classes\\Directory\\shell\\EchoVault", nullptr, L"EchoVault (Lock/Unlock)") && ok;
+    ok = writeReg(L"Software\\Classes\\Directory\\shell\\EchoVault\\command", nullptr, commandStr) && ok;
+    std::wstring openCommand = L"\"" + std::wstring(exePath) + L"\" --open \"%1\"";
+    ok = writeReg(L"Software\\Classes\\*\\shell\\EchoVaultOpen", nullptr, L"Open with EchoVault") && ok;
+    ok = writeReg(L"Software\\Classes\\*\\shell\\EchoVaultOpen\\command", nullptr, openCommand) && ok;
+    if (!ok) return false;
 
     ShowInfo(L"EchoVault", L"Windows Explorer integration installed successfully!\n\nYou can now right-click any file or folder and select 'EchoVault (Lock/Unlock)'.");
     return true;
@@ -761,637 +775,255 @@ void ShowInfo(const std::wstring& title, const std::wstring& message)
 }
 
 //====================================================================
-// Open interception \u2014 auto-unlock on double-click
-//
-// Encrypted files keep their original extension, so double-clicking one
-// would normally open the raw ciphertext in the associated program. To
-// make EchoVault intercept that open, we register EchoVault as the
-// default handler for a set of common extensions and remember what the
-// original handler was. When EchoVault is then invoked with
-// "--open <file>" it either unlocks the file (password prompt, decrypt
-// in place, open) or passes plain files straight through to the original
-// program. This gives the end-user behaviour of a minifilter driver
-// without needing a signed kernel driver.
-//====================================================================
-
-static const wchar_t* kInterceptExts[] = {
-    // Documents & text
-    L".txt", L".md", L".log", L".ini", L".cfg", L".conf",
-    L".csv", L".tsv", L".json", L".xml", L".yaml", L".yml", L".rtf",
-    L".doc", L".docx", L".xls", L".xlsx", L".ppt", L".pptx", L".pdf",
-    // Code & scripts
-    L".py", L".pyw", L".ipynb", L".cpp", L".c", L".h", L".hpp", L".cc",
-    L".cs", L".java", L".kt", L".swift", L".go", L".rs", L".rb", L".php",
-    L".js", L".mjs", L".cjs", L".jsx", L".ts", L".tsx", L".html", L".htm",
-    L".css", L".scss", L".sql", L".lua", L".pl", L".r", L".sh", L".bat",
-    L".cmd", L".ps1", L".vbs", L".ahk",
-    // Accessibility / audio-game scripting
-    L".bgt", L".nvgt", L".sbl",
-    // Images
-    L".png", L".jpg", L".jpeg", L".gif", L".bmp", L".tiff", L".svg", L".webp",
-    // Audio / video
-    L".mp3", L".wav", L".m4a", L".ogg", L".flac",
-    L".mp4", L".mkv", L".avi", L".mov", L".wmv", L".webm",
-};
-static const size_t kInterceptExtCount =
-    sizeof(kInterceptExts) / sizeof(kInterceptExts[0]);
+// User-controlled Explorer integration. Never writes or deletes UserChoice.
+// A default app is chosen in Windows Settings, not enforced by a watcher.
 
 static std::wstring ToLowerW(std::wstring s)
 {
-    for (auto& c : s)
-        if (c >= L'A' && c <= L'Z')
-            c += (L'a' - L'A');
+    for (auto& c : s) if (c >= L'A' && c <= L'Z') c += L'a' - L'A';
     return s;
 }
-
 static std::wstring GetExePath()
 {
-    wchar_t buf[MAX_PATH];
-    if (!GetModuleFileNameW(nullptr, buf, MAX_PATH)) return L"";
-    return buf;
+    wchar_t path[32768] = {};
+    DWORD n = GetModuleFileNameW(nullptr, path, 32768);
+    return n && n < 32768 ? std::wstring(path, n) : L"";
 }
-
-// ------------------------------------------------------------------
-// The interception list is user-extensible: any extra extensions listed
-// in %LOCALAPPDATA%\EchoVault\intercept-extensions.txt (one per line,
-// "#" for comments) are added to the built-in list. Use the CLI verbs
-// --add-ext <ext> / --remove-ext <ext> to manage it.
-// ------------------------------------------------------------------
-
-static std::filesystem::path GetInterceptExtsFile()
+static std::wstring ReadReg(HKEY root, const std::wstring& path, const wchar_t* name = nullptr)
 {
-    wchar_t buf[MAX_PATH];
-    if (GetEnvironmentVariableW(L"LOCALAPPDATA", buf, MAX_PATH) == 0)
-        return {};
-    std::filesystem::path dir = std::filesystem::path(buf) / L"EchoVault";
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    return dir / L"intercept-extensions.txt";
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(root, path.c_str(), 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS) return {};
+    wchar_t value[32768] = {};
+    DWORD size = sizeof(value), type = 0;
+    LONG rc = RegQueryValueExW(key, name, nullptr, &type, reinterpret_cast<BYTE*>(value), &size);
+    RegCloseKey(key);
+    if (rc != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ) || size >= sizeof(value)) return {};
+    return value;
 }
-
-static std::vector<std::wstring> LoadUserExts()
+static bool WriteReg(const std::wstring& path, const wchar_t* name, const std::wstring& value)
 {
-    std::vector<std::wstring> out;
-    std::ifstream f(GetInterceptExtsFile());
-    if (!f) return out;
-    std::string line;
-    while (std::getline(f, line))
-    {
-        size_t b = line.find_first_not_of(" \t\r\n");
-        if (b == std::string::npos) continue;
-        size_t e = line.find_last_not_of(" \t\r\n");
-        std::string s = line.substr(b, e - b + 1);
-        if (s.empty() || s[0] == '#') continue;
-        std::wstring w;
-        for (char c : s) w += (wchar_t)(unsigned char)c;
-        if (w.empty()) continue;
-        if (w[0] != L'.') w = L"." + w;
-        w = ToLowerW(w);
-        bool dup = false;
-        for (auto& x : out) if (x == w) { dup = true; break; }
-        if (!dup) out.push_back(w);
+    HKEY key = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, path.c_str(), 0, nullptr, 0, KEY_SET_VALUE,
+                       nullptr, &key, nullptr) != ERROR_SUCCESS) return false;
+    LONG rc = RegSetValueExW(key, name, 0, REG_SZ, reinterpret_cast<const BYTE*>(value.c_str()),
+                            static_cast<DWORD>((value.size() + 1) * sizeof(wchar_t)));
+    RegCloseKey(key);
+    return rc == ERROR_SUCCESS;
+}
+static void DeleteRegValue(const std::wstring& path, const wchar_t* name)
+{
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, path.c_str(), 0, KEY_SET_VALUE, &key) == ERROR_SUCCESS) {
+        RegDeleteValueW(key, name);
+        RegCloseKey(key);
     }
-    return out;
 }
-
-static std::vector<std::wstring> AllInterceptExts()
+static const std::wstring kIntegration = L"Software\\EchoVault\\OpenInterception";
+static const std::wstring kCapabilities = L"Software\\EchoVault\\Capabilities";
+static const wchar_t* kCommonExtensions[] = {
+    L".txt", L".md", L".log", L".ini", L".cfg", L".conf", L".csv", L".tsv",
+    L".json", L".xml", L".yaml", L".yml", L".rtf", L".doc", L".docx", L".xls",
+    L".xlsx", L".ppt", L".pptx", L".pdf", L".cpp", L".c",
+    L".h", L".hpp", L".cs", L".java", L".go", L".rs",
+    L".ts", L".html", L".htm", L".css", L".sql", L".bgt",
+    L".nvgt", L".sbl", L".png", L".jpg", L".jpeg", L".gif", L".bmp", L".tiff",
+    L".svg", L".webp", L".mp3", L".wav", L".m4a", L".ogg", L".flac", L".mp4",
+    L".mkv", L".avi", L".mov", L".wmv", L".webm"
+};
+static std::vector<std::wstring> RegisteredExtensions()
 {
-    std::vector<std::wstring> v;
-    for (size_t i = 0; i < kInterceptExtCount; i++)
-        v.push_back(ToLowerW(kInterceptExts[i]));
-    auto user = LoadUserExts();
-    for (auto& u : user)
-    {
-        bool dup = false;
-        for (auto& x : v) if (x == u) { dup = true; break; }
-        if (!dup) v.push_back(u);
+    std::vector<std::wstring> exts;
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kIntegration.c_str(), 0, KEY_ENUMERATE_SUB_KEYS, &key) != ERROR_SUCCESS) return exts;
+    for (DWORD i = 0;; ++i) {
+        wchar_t name[256] = {}; DWORD n = 256;
+        LONG rc = RegEnumKeyExW(key, i, name, &n, nullptr, nullptr, nullptr, nullptr);
+        if (rc == ERROR_NO_MORE_ITEMS) break;
+        if (rc == ERROR_SUCCESS && name[0] == L'.') exts.emplace_back(name, n);
     }
-    return v;
+    RegCloseKey(key);
+    return exts;
 }
-
-bool AddOpenInterceptionExt(const std::wstring& extIn)
+static std::wstring CurrentHandler(const std::wstring& ext)
 {
-    std::wstring ext = extIn;
-    if (ext.empty()) return false;
-    if (ext[0] != L'.') ext = L"." + ext;
-    ext = ToLowerW(ext);
-
-    auto exts = LoadUserExts();
-    bool found = false;
-    for (auto& x : exts) if (x == ext) { found = true; break; }
-    if (!found) exts.push_back(ext);
-
-    std::ofstream f(GetInterceptExtsFile(), std::ios::trunc);
-    if (!f) return false;
-    for (auto& x : exts)
-        f << std::string(x.begin(), x.end()) << "\n";
-    f.close();
-
-    // Re-apply so the new extension is intercepted immediately.
-    return InstallOpenInterception();
+    auto chosen = ReadReg(HKEY_CURRENT_USER,
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\" + ext + L"\\UserChoice", L"ProgId");
+    if (!chosen.empty()) return chosen;
+    return ReadReg(HKEY_CLASSES_ROOT, ext);
 }
-
-bool RemoveOpenInterceptionExt(const std::wstring& extIn)
+bool RepairScriptAssociations()
 {
-    std::wstring ext = extIn;
-    if (ext.empty()) return false;
-    if (ext[0] != L'.') ext = L"." + ext;
-    ext = ToLowerW(ext);
-
-    auto exts = LoadUserExts();
-    auto it = exts.begin();
-    while (it != exts.end())
-    {
-        if (*it == ext) it = exts.erase(it);
-        else ++it;
-    }
-
-    std::ofstream f(GetInterceptExtsFile(), std::ios::trunc);
-    if (!f) return false;
-    for (auto& x : exts)
-        f << std::string(x.begin(), x.end()) << "\n";
-    f.close();
-
-    return InstallOpenInterception();
-}
-
-// Windows' "UserChoice" key (set when a user picks an app via
-// Open With / Settings) OVERRIDES the extension's default ProgID.
-// Delete it so our mapping actually wins for double-clicks.
-// Returns true only if a UserChoice key was actually removed — callers
-// rely on this to avoid notifying the shell about changes that didn't
-// happen (which would otherwise loop back into this watcher).
-//
-// A RegDeleteTreeW on a NONEXISTENT key is surprisingly expensive
-// (~1 ms each), and this is called for every registered extension every
-// second — so probe existence first and only delete when something is
-// actually there. That makes the steady-state sweep (no UserChoice
-// present) nearly free.
-static bool DeleteUserChoiceForExt(const std::wstring& ext)
-{
-    std::wstring ucKey =
-        L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\" +
-        ext + L"\\UserChoice";
-
-    HKEY hProbe = nullptr;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, ucKey.c_str(), 0, KEY_READ, &hProbe) != ERROR_SUCCESS)
-        return false;   // no UserChoice — fast path, nothing to do
-    RegCloseKey(hProbe);
-
-    return RegDeleteTreeW(HKEY_CURRENT_USER, ucKey.c_str()) == ERROR_SUCCESS;
-}
-
-// ------------------------------------------------------------------
-// Background association watcher
-// ------------------------------------------------------------------
-// When the user picks another program via "Open with", Windows writes a
-// UserChoice key that OVERRIDES the extension's default handler — so the
-// next double-click would go straight to that program, past EchoVault.
-// This watcher runs as a hidden-window process (no polling loop burning
-// CPU: it blocks on a message queue and wakes only on shell
-// association-change notifications, plus a low-frequency safety sweep)
-// and re-deletes those overrides for every extension we have taken over.
-// ------------------------------------------------------------------
-
-#define WM_ASSOC_CHANGED (WM_APP + 1)
-
-static const wchar_t* kWatcherMutexName = L"EchoVaultAssocWatcher";
-static const wchar_t* kWatcherStopEvent = L"EchoVaultAssocWatcherStop";
-static const wchar_t* kWatcherRunValue  = L"EchoVaultAssocWatcher";
-static const UINT_PTR kSweepTimerId     = 1;
-// 30 s: the real triggers are event-driven (a shell notification when an
-// association changes + a registry notification when FileExts changes), so
-// this timer is only a rare safety net for events we miss. It must NOT be
-// short: every sweep touches a UserChoice path per registered extension,
-// and those accesses are expensive (~0.5 ms each) because Windows
-// Defender's tamper protection hooks them.
-static const UINT      kSweepIntervalMs = 30000;
-
-static std::wstring GetWatcherRunCommand()
-{
-    std::wstring cmd;
-    HKEY h = nullptr;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER,
-            L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
-            0, KEY_READ, &h) == ERROR_SUCCESS)
-    {
-        wchar_t buf[1024] = L"";
-        DWORD sz = sizeof(buf), type = 0;
-        if (RegQueryValueExW(h, kWatcherRunValue, nullptr, &type,
-                reinterpret_cast<BYTE*>(buf), &sz) == ERROR_SUCCESS && sz > sizeof(wchar_t))
-            cmd = buf;
-        RegCloseKey(h);
-    }
-    return cmd;
-}
-
-// Re-asserts EchoVault's ownership of every intercepted extension by
-// deleting Windows' UserChoice override (the key "Open with" writes,
-// which would otherwise send the next double-click straight to the
-// chosen app, past EchoVault). Also called on every --open so the
-// mapping self-heals even if the watcher is not running. Returns true
-// if any override was removed.
-void ReassertInterception()
-{
-    HKEY hBase = nullptr;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\EchoVault\\OpenInterception",
-            0, KEY_READ, &hBase) != ERROR_SUCCESS)
-        return;
-
+    struct ScriptType { const wchar_t* extension; const wchar_t* fallback; };
+    static const ScriptType scripts[] = {
+        { L".bat", L"batfile" }, { L".cmd", L"cmdfile" },
+        { L".ps1", L"" }, { L".vbs", L"VBSFile" }, { L".js", L"JSFile" },
+        { L".mjs", L"" }, { L".cjs", L"" }, { L".py", L"" },
+        { L".pyw", L"" }, { L".rb", L"" }, { L".php", L"" },
+        { L".lua", L"" }, { L".sh", L"" }, { L".ahk", L"" }
+    };
+    bool success = true;
     bool changed = false;
-    wchar_t name[128];
-    DWORD nsz = 128;
-    for (DWORD i = 0;
-         RegEnumKeyExW(hBase, i, name, &nsz, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS;
-         i++)
-    {
-        std::wstring ext = name;
-        if (!ext.empty() && ext[0] == L'.')
-        {
-            if (DeleteUserChoiceForExt(ext))
+    for (const auto& script : scripts) {
+        std::wstring ext = script.extension;
+        std::wstring backupPath = kIntegration + L"\\" + ext;
+        std::wstring backup = ReadReg(HKEY_CURRENT_USER, backupPath, L"ProgID");
+        std::wstring replacement = backup.empty() ? script.fallback : backup;
+        std::wstring userChoicePath =
+            L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\\" +
+            ext + L"\\UserChoice";
+        std::wstring chosen = ReadReg(HKEY_CURRENT_USER, userChoicePath, L"ProgId");
+        if (ToLowerW(chosen) == L"echovaultopen") {
+            LONG rc = RegDeleteTreeW(HKEY_CURRENT_USER, userChoicePath.c_str());
+            if (rc != ERROR_SUCCESS && rc != ERROR_FILE_NOT_FOUND && rc != ERROR_PATH_NOT_FOUND)
+                success = false;
+            else
                 changed = true;
         }
-        nsz = 128;
+        std::wstring classPath = L"Software\\Classes\\" + ext;
+        if (ToLowerW(ReadReg(HKEY_CURRENT_USER, classPath)) == L"echovaultopen") {
+            if (replacement.empty())
+                DeleteRegValue(classPath, nullptr);
+            else if (!WriteReg(classPath, nullptr, replacement))
+                success = false;
+            changed = true;
+        }
+        DeleteRegValue(classPath + L"\\OpenWithProgids", L"EchoVaultOpen");
+        DeleteRegValue(kCapabilities + L"\\FileAssociations", ext.c_str());
+        RegDeleteTreeW(HKEY_CURRENT_USER, backupPath.c_str());
     }
-    RegCloseKey(hBase);
-
     if (changed)
         SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
+    return success;
 }
-
-// Re-asserts and reports whether the watcher should keep running.
-// Returns false when the watcher should exit (interception uninstalled,
-// or the exe was moved/reinstalled).
-static bool SweepAssociationOverrides()
+static bool FindOriginalHandler(const std::wstring& ext, std::wstring& prog, std::wstring& command)
 {
-    if (!IsOpenInterceptionInstalled())
-        return false;
-
-    // Stale watcher (exe moved / reinstalled elsewhere): the new install
-    // starts its own. Exit quietly.
-    std::wstring runCmd = GetWatcherRunCommand();
-    if (!runCmd.empty() && runCmd.find(GetExePath()) == std::wstring::npos)
-        return false;
-
-    ReassertInterception();
+    prog = CurrentHandler(ext);
+    if (ToLowerW(prog) == L"echovaultopen") {
+        prog = ReadReg(HKEY_CURRENT_USER, kIntegration + L"\\" + ext, L"ProgID");
+        command = ReadReg(HKEY_CURRENT_USER, kIntegration + L"\\" + ext, L"Command");
+    } else command = ReadReg(HKEY_CLASSES_ROOT, prog + L"\\shell\\open\\command");
+    return !prog.empty() && !command.empty() && ToLowerW(prog) != L"echovaultopen";
+}
+bool IsOpenInterceptionInstalled()
+{
+    return ReadReg(HKEY_CURRENT_USER, kIntegration, L"Mode") == L"UserChoice";
+}
+static bool RegisterExtension(std::wstring ext)
+{
+    ext = ToLowerW(ext);
+    if (ext.empty() || ext[0] != L'.' || ext.size() > 64 ||
+        ext.find_first_of(L"\\/\" :*?") != std::wstring::npos) return false;
+    static const wchar_t* executableScripts[] = {
+        L".bat", L".cmd", L".ps1", L".vbs", L".js", L".mjs", L".cjs",
+        L".py", L".pyw", L".rb", L".php", L".lua", L".sh", L".ahk"
+    };
+    for (const auto* script : executableScripts)
+        if (ext == script) return false;
+    std::wstring prog, command;
+    FindOriginalHandler(ext, prog, command);
+    auto backup = kIntegration + L"\\" + ext;
+    if (!prog.empty() && ReadReg(HKEY_CURRENT_USER, backup, L"ProgID").empty()) {
+        if (!WriteReg(backup, L"ProgID", prog) || !WriteReg(backup, L"Command", command)) return false;
+    }
+    return WriteReg(backup, L"Registered", L"1") &&
+        WriteReg(L"Software\\Classes\\" + ext + L"\\OpenWithProgids", L"EchoVaultOpen", L"") &&
+        WriteReg(kCapabilities + L"\\FileAssociations", ext.c_str(), L"EchoVaultOpen");
+}
+void EnsureExtensionIntercepted(const std::wstring& ext)
+{
+    // Encryption itself does not install startup tasks or change defaults.
+    if (!IsOpenInterceptionInstalled() || !RegisterExtension(ext)) return;
+    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
+    if (ReadReg(HKEY_CURRENT_USER, kIntegration, L"SettingsOffered") != L"1" &&
+        ToLowerW(CurrentHandler(ToLowerW(ext))) != L"echovaultopen") {
+        // Persist this choice so right-click launches (each a new process) do
+        // not repeat the same reminder for every encrypted file.
+        WriteReg(kIntegration, L"SettingsOffered", L"1");
+        if (MessageBoxW(nullptr,
+            (L"EchoVault is now available for " + ToLowerW(ext) +
+             L" files, but Windows is still sending double-clicks to another app. "
+             L"Until you choose EchoVault for this type, use 'Open with EchoVault' or the app menu.\n\n"
+             L"Open Windows Default Apps now?").c_str(),
+            L"EchoVault - Enable double-click prompt", MB_YESNO | MB_ICONINFORMATION | MB_DEFBUTTON2) == IDYES)
+            ShellExecuteW(nullptr, L"open", L"ms-settings:defaultapps?registeredAppUser=EchoVault",
+                          nullptr, nullptr, SW_SHOWNORMAL);
+    }
+}
+bool AddOpenInterceptionExt(const std::wstring& ext)
+{
+    return IsOpenInterceptionInstalled() && RegisterExtension(ext.empty() || ext[0] == L'.' ? ext : L"." + ext);
+}
+bool RemoveOpenInterceptionExt(const std::wstring& extIn)
+{
+    std::wstring ext = ToLowerW(extIn);
+    if (ext.empty()) return false;
+    if (ext[0] != L'.') ext = L"." + ext;
+    if (ext.find_first_of(L"\\/\" :*?") != std::wstring::npos) return false;
+    DeleteRegValue(L"Software\\Classes\\" + ext + L"\\OpenWithProgids", L"EchoVaultOpen");
+    DeleteRegValue(kCapabilities + L"\\FileAssociations", ext.c_str());
+    // Keep the original handler backup: Windows may still have EchoVault
+    // selected for this type until the user chooses something else in Settings.
+    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
     return true;
 }
-
-// Coalesces the event-driven sweeps: the shell notification, the registry
-// notification and our own "fixed it" notification can fire within the same
-// second, and the sweep is not cheap, so run it at most once per second.
-static ULONGLONG g_LastSweepMs = 0;
-
-static LRESULT CALLBACK WatcherWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+static std::wstring AssociationStatus()
 {
-    if (msg == WM_ASSOC_CHANGED || msg == WM_TIMER)
-    {
-        ULONGLONG now = GetTickCount64();
-        if (now - g_LastSweepMs >= 1000)
-        {
-            g_LastSweepMs = now;
-            if (!SweepAssociationOverrides())
-                PostMessageW(hwnd, WM_CLOSE, 0, 0);
-        }
-        return 0;
+    if (!IsOpenInterceptionInstalled()) return L"Explorer setup has not been enabled.";
+    int active = 0, other = 0;
+    std::wstring names;
+    for (const auto& ext : RegisteredExtensions()) {
+        if (ToLowerW(CurrentHandler(ext)) == L"echovaultopen") ++active;
+        else { ++other; if (other <= 15) names += ext + L" "; }
     }
-    if (msg == WM_CLOSE) { DestroyWindow(hwnd); return 0; }
-    if (msg == WM_DESTROY) { PostQuitMessage(0); return 0; }
-    return DefWindowProcW(hwnd, msg, wParam, lParam);
+    return L"File types set to open with EchoVault: " + std::to_wstring(active) +
+        L"\nFile types using another app or not yet selected: " + std::to_wstring(other) +
+        L"\n" + names + L"\n\nAnother app may show encrypted bytes instead of a password prompt. "
+        L"Encryption remains in place. Use EchoVault's Decrypt button or right-click menu, "
+        L"or choose EchoVault for that file type in Windows Settings. This affects all files of that type.";
 }
-
-int RunAssocWatcher()
+void ReassertInterception()
 {
-    HANDLE hMutex = CreateMutexW(nullptr, TRUE, kWatcherMutexName);
-    if (!hMutex) return 1;
-    if (GetLastError() == ERROR_ALREADY_EXISTS)
-    {
-        CloseHandle(hMutex);
-        return 0;   // another watcher is already running
-    }
-
-    HANDLE hStop = CreateEventW(nullptr, TRUE, FALSE, kWatcherStopEvent);
-    if (!hStop) { ReleaseMutex(hMutex); CloseHandle(hMutex); return 1; }
-    ResetEvent(hStop);   // clear a stale signal from a previous uninstall
-
-    HINSTANCE hInst = GetModuleHandle(nullptr);
-    WNDCLASSW wc = {};
-    wc.lpfnWndProc = WatcherWndProc;
-    wc.hInstance = hInst;
-    wc.lpszClassName = L"EchoVaultAssocWatcherWnd";
-    RegisterClassW(&wc);
-    HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"", 0,
-        0, 0, 0, 0, HWND_MESSAGE, nullptr, hInst, nullptr);
-
-    ULONG notifyReg = 0;
-    if (hwnd)
-    {
-        SHChangeNotifyEntry ent = { nullptr, TRUE };
-        notifyReg = SHChangeNotifyRegister(hwnd, SHCNRF_ShellLevel,
-            SHCNE_ASSOCCHANGED, WM_ASSOC_CHANGED, 1, &ent);
-    }
-
-    if (!hwnd)
-    {
-        // Hidden window failed (extremely unlikely): fall back to polling.
-        for (;;)
-        {
-            if (WaitForSingleObject(hStop, kSweepIntervalMs) == WAIT_OBJECT_0)
-                break;
-            if (!SweepAssociationOverrides())
-                break;
-        }
-        ReleaseMutex(hMutex);
-        CloseHandle(hMutex);
-        CloseHandle(hStop);
-        return 0;
-    }
-
-    // Direct registry trigger: wake the moment anything under FileExts
-    // changes (e.g. Explorer writes a UserChoice for "Open with"). This is
-    // the primary signal; the shell notification above is a second one;
-    // the (now rare) timer below is only a safety net. Keeping the process
-    // event-driven instead of polling every second matters: a full sweep
-    // touches every registered extension's UserChoice path, and those
-    // accesses are slow because Defender's tamper protection hooks them.
-    HANDLE hNotifyEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    HKEY hFileExts = nullptr;
-    RegOpenKeyExW(HKEY_CURRENT_USER,
-        L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts",
-        0, KEY_NOTIFY, &hFileExts);
-
-    auto ArmRegNotify = [&]() {
-        if (hFileExts && hNotifyEvent)
-            RegNotifyChangeKeyValue(hFileExts, TRUE,
-                REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_CHANGE_NAME,
-                hNotifyEvent, TRUE);
-    };
-
-    // Fix any override created while the watcher was down, then wait.
-    if (!SweepAssociationOverrides())
-        PostMessageW(hwnd, WM_CLOSE, 0, 0);
-    ArmRegNotify();
-    SetTimer(hwnd, kSweepTimerId, kSweepIntervalMs, nullptr);
-
-    HANDLE waitObjs[2] = { hStop, hNotifyEvent ? hNotifyEvent : hStop };
-    MSG msg;
-    for (;;)
-    {
-        DWORD r = MsgWaitForMultipleObjectsEx(2, waitObjs, INFINITE,
-            QS_ALLINPUT, MWMO_INPUTAVAILABLE);
-        if (r == WAIT_OBJECT_0)
-            break;   // stop event signalled (uninstall)
-        if (r == WAIT_OBJECT_0 + 1)
-        {
-            // FileExts changed — re-arm and run a (throttled) sweep.
-            ArmRegNotify();
-            PostMessageW(hwnd, WM_ASSOC_CHANGED, 0, 0);
-            continue;
-        }
-        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE))
-        {
-            if (msg.message == WM_QUIT)
-            {
-                ReleaseMutex(hMutex);
-                CloseHandle(hMutex);
-                CloseHandle(hStop);
-                if (hNotifyEvent) CloseHandle(hNotifyEvent);
-                if (hFileExts) RegCloseKey(hFileExts);
-                return 0;
-            }
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
-    }
-
-    if (notifyReg)
-        SHChangeNotifyDeregister(notifyReg);
-    KillTimer(hwnd, kSweepTimerId);
-    DestroyWindow(hwnd);
-    if (hNotifyEvent) CloseHandle(hNotifyEvent);
-    if (hFileExts) RegCloseKey(hFileExts);
-    ReleaseMutex(hMutex);
-    CloseHandle(hMutex);
-    CloseHandle(hStop);
-    return 0;
+    // Compatibility entry point: report only. Do not fight the user's choice.
+    static std::wstring last;
+    std::wstring status = AssociationStatus();
+    if (status == last) return;
+    auto path = GetVaultDirectory() / L"association-status.txt";
+    std::wofstream out(path);
+    if (out) { out << status; last = status; }
 }
-
+static const wchar_t* kWatcherStopEvent = L"EchoVaultAssocWatcherStop";
 void StopAssocWatcher()
 {
-    HANDLE h = OpenEventW(EVENT_MODIFY_STATE, FALSE, kWatcherStopEvent);
-    if (h)
-    {
-        SetEvent(h);
-        CloseHandle(h);
-    }
+    HANDLE event = OpenEventW(EVENT_MODIFY_STATE, FALSE, kWatcherStopEvent);
+    if (event) { SetEvent(event); CloseHandle(event); }
 }
-
 bool StartAssocWatcher()
 {
-    // Already running?
-    HANDLE hMutex = OpenMutexW(SYNCHRONIZE, FALSE, kWatcherMutexName);
-    if (hMutex)
-    {
-        CloseHandle(hMutex);
-        return true;
-    }
-
-    std::wstring exe = GetExePath();
-    if (exe.empty()) return false;
-    std::wstring cmd = L"\"" + exe + L"\" --watch";
-    STARTUPINFOW si = {};
-    si.cb = sizeof(si);
+    if (!IsOpenInterceptionInstalled()) return false;
+    HANDLE existing = OpenMutexW(SYNCHRONIZE, FALSE, L"EchoVaultAssocWatcher");
+    if (existing) { CloseHandle(existing); return true; }
+    auto exe = GetExePath();
+    std::wstring command = L"\"" + exe + L"\" --watch";
+    STARTUPINFOW si = {}; si.cb = sizeof(si);
     PROCESS_INFORMATION pi = {};
-    if (CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE,
-            CREATE_NO_WINDOW | DETACHED_PROCESS, nullptr, nullptr, &si, &pi))
-    {
-        CloseHandle(pi.hThread);
-        CloseHandle(pi.hProcess);
-        return true;
-    }
-    return false;
+    if (!CreateProcessW(exe.c_str(), command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+                        nullptr, nullptr, &si, &pi)) return false;
+    CloseHandle(pi.hThread); CloseHandle(pi.hProcess); return true;
 }
-
-// ------------------------------------------------------------------
-// Task Scheduler self-heal for the watcher.
-//
-// The watcher reverts "Open with" overrides. It starts at logon via the
-// Run key, but if it is ever killed or crashes, nothing would restart
-// it until the next logon — and in the meantime double-clicks could
-// bypass EchoVault. So we also register a scheduled task that (a) fires
-// at logon, (b) repeats every 5 minutes for the whole session (reviving
-// the watcher within minutes if it ever dies) and (c) restarts it on
-// failure. The watcher's own mutex makes relaunches free: a second
-// instance exits instantly when one is already running.
-// ------------------------------------------------------------------
-
-static std::wstring XmlEscape(const std::wstring& s)
+int RunAssocWatcher()
 {
-    std::wstring out;
-    out.reserve(s.size());
-    for (wchar_t c : s)
-    {
-        switch (c)
-        {
-            case L'&':  out += L"&amp;";  break;
-            case L'<':  out += L"&lt;";   break;
-            case L'>':  out += L"&gt;";   break;
-            case L'"':  out += L"&quot;"; break;
-            default:    out += c;          break;
-        }
+    HANDLE mutex = CreateMutexW(nullptr, FALSE, L"EchoVaultAssocWatcher");
+    if (!mutex) return 1;
+    if (GetLastError() == ERROR_ALREADY_EXISTS) { CloseHandle(mutex); return 0; }
+    HANDLE stop = CreateEventW(nullptr, TRUE, FALSE, kWatcherStopEvent);
+    if (!stop) { CloseHandle(mutex); return 1; }
+    ResetEvent(stop);
+    while (IsOpenInterceptionInstalled()) {
+        ReassertInterception();
+        if (WaitForSingleObject(stop, 30000) != WAIT_TIMEOUT) break;
     }
-    return out;
+    CloseHandle(stop); CloseHandle(mutex); return 0;
 }
-
-static std::wstring BuildTaskXml(const wchar_t* taskName,
-                                 const wchar_t* description,
-                                 const wchar_t* args)
-{
-    std::wstring userId;
-    {
-        wchar_t dom[256] = L"", usr[256] = L"";
-        DWORD dn = 256, un = 256;
-        if (GetEnvironmentVariableW(L"USERDOMAIN", dom, dn) &&
-            GetEnvironmentVariableW(L"USERNAME", usr, un) && usr[0])
-        {
-            userId = dom;
-            userId += L"\\";
-            userId += usr;
-        }
-    }
-
-    (void)taskName;   // the task name is the registration path
-
-    std::wstring xml;
-    xml += L"<?xml version=\"1.0\" encoding=\"UTF-16\"?>\n";
-    xml += L"<Task version=\"1.4\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\n";
-    xml += L"  <RegistrationInfo>\n";
-    xml += L"    <Author>EchoVault</Author>\n";
-    xml += L"    <Description>";
-    xml += description;
-    xml += L"</Description>\n";
-    xml += L"  </RegistrationInfo>\n";
-    xml += L"  <Triggers>\n";
-    xml += L"    <LogonTrigger>\n";
-    xml += L"      <Enabled>true</Enabled>\n";
-    if (!userId.empty())
-        xml += L"      <UserId>" + XmlEscape(userId) + L"</UserId>\n";
-    xml += L"    </LogonTrigger>\n";
-    xml += L"    <TimeTrigger>\n";
-    xml += L"      <StartBoundary>2020-01-01T00:00:00</StartBoundary>\n";
-    xml += L"      <Enabled>true</Enabled>\n";
-    xml += L"      <Repetition>\n";
-    // 1-minute refire: the task is the recovery net for a killed
-    // watcher/guard (user-mode processes can be killed; the kernel
-    // driver cannot). Each firing exits instantly when the process is
-    // already running (mutex), so this costs almost nothing and bounds
-    // the dead window to about a minute.
-    xml += L"        <Interval>PT1M</Interval>\n";
-    xml += L"        <Duration>P3650D</Duration>\n";
-    xml += L"        <StopAtDurationEnd>false</StopAtDurationEnd>\n";
-    xml += L"      </Repetition>\n";
-    xml += L"    </TimeTrigger>\n";
-    xml += L"  </Triggers>\n";
-    xml += L"  <Principals>\n";
-    xml += L"    <Principal id=\"Author\">\n";
-    xml += L"      <LogonType>InteractiveToken</LogonType>\n";
-    xml += L"      <RunLevel>LeastPrivilege</RunLevel>\n";
-    xml += L"    </Principal>\n";
-    xml += L"  </Principals>\n";
-    xml += L"  <Settings>\n";
-    xml += L"    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n";
-    xml += L"    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n";
-    xml += L"    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n";
-    xml += L"    <AllowHardTerminate>true</AllowHardTerminate>\n";
-    xml += L"    <StartWhenAvailable>true</StartWhenAvailable>\n";
-    xml += L"    <AllowStartOnDemand>true</AllowStartOnDemand>\n";
-    xml += L"    <Enabled>true</Enabled>\n";
-    xml += L"    <Hidden>true</Hidden>\n";
-    xml += L"    <RunOnlyIfIdle>false</RunOnlyIfIdle>\n";
-    xml += L"    <WakeToRun>false</WakeToRun>\n";
-    xml += L"    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\n";
-    xml += L"    <Priority>7</Priority>\n";
-    xml += L"    <RestartOnFailure>\n";
-    xml += L"      <Interval>PT1M</Interval>\n";
-    xml += L"      <Count>3</Count>\n";
-    xml += L"    </RestartOnFailure>\n";
-    xml += L"  </Settings>\n";
-    xml += L"  <Actions Context=\"Author\">\n";
-    xml += L"    <Exec>\n";
-    xml += L"      <Command>\"" + XmlEscape(GetExePath()) + L"\"</Command>\n";
-    xml += L"      <Arguments>";
-    xml += args;
-    xml += L"</Arguments>\n";
-    xml += L"    </Exec>\n";
-    xml += L"  </Actions>\n";
-    xml += L"</Task>\n";
-    return xml;
-}
-
-static bool RegisterTaskByName(const wchar_t* taskName,
-                               const wchar_t* description,
-                               const wchar_t* args);
-
-static bool RegisterWatcherTask()
-{
-    // The watcher task revives the association watcher; the guard task
-    // revives the password-prompt service when the minifilter is loaded.
-    bool ok = RegisterTaskByName(L"EchoVaultWatcher",
-        L"Keeps EchoVault's open interception active: runs the association watcher and revives it if it ever stops.",
-        L"--watch");
-    RegisterTaskByName(L"EchoVaultGuard",
-        L"EchoVault password-prompt service: listens for denied opens of encrypted files (requires the EchoVault minifilter) and revives itself if it ever stops.",
-        L"--guard");
-    return ok;
-}
-
-static bool RegisterTaskByName(const wchar_t* taskName,
-                               const wchar_t* description,
-                               const wchar_t* args)
-{
-    std::wstring xml = BuildTaskXml(taskName, description, args);
-    bool ok = false;
-    HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    if (SUCCEEDED(hr) || hr == RPC_E_CHANGED_MODE)
-    {
-        ITaskService* pSvc = nullptr;
-        if (SUCCEEDED(CoCreateInstance(CLSID_TaskScheduler, nullptr, CLSCTX_INPROC_SERVER,
-                IID_ITaskService, reinterpret_cast<void**>(&pSvc))))
-        {
-            if (SUCCEEDED(pSvc->Connect(VARIANT(), VARIANT(), VARIANT(), VARIANT())))
-            {
-                ITaskFolder* pRoot = nullptr;
-                BSTR rootPath = SysAllocString(L"\\");
-                if (rootPath && SUCCEEDED(pSvc->GetFolder(rootPath, &pRoot)))
-                {
-                    BSTR name = SysAllocString(taskName);
-                    BSTR xmlB = SysAllocString(xml.c_str());
-                    ITaskDefinition* pDef = nullptr;
-                    IRegisteredTask* pTask = nullptr;
-                    if (name && xmlB &&
-                        SUCCEEDED(pSvc->NewTask(0, &pDef)) &&
-                        SUCCEEDED(pDef->put_XmlText(xmlB)) &&
-                        SUCCEEDED(pRoot->RegisterTaskDefinition(name, pDef,
-                            TASK_CREATE_OR_UPDATE, VARIANT(), VARIANT(),
-                            TASK_LOGON_INTERACTIVE_TOKEN, VARIANT(), &pTask)))
-                    {
-                        ok = true;
-                    }
-                    if (pTask) pTask->Release();
-                    if (pDef) pDef->Release();
-                    if (name) SysFreeString(name);
-                    if (xmlB) SysFreeString(xmlB);
-                    pRoot->Release();
-                }
-                if (rootPath) SysFreeString(rootPath);
-            }
-            pSvc->Release();
-        }
-    }
-    if (SUCCEEDED(hr)) CoUninitialize();
-    return ok;
-}
-
 static void RemoveTaskByName(const wchar_t* taskName)
 {
     HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -1423,567 +1055,85 @@ static void RemoveTaskByName(const wchar_t* taskName)
     if (SUCCEEDED(hr)) CoUninitialize();
 }
 
-static void RemoveWatcherTask()
+
+// Only reverse the legacy values EchoVault itself owned. Keep other values,
+// OpenWith lists, and Windows UserChoice intact.
+static void RestoreLegacyDefaults()
 {
+    for (const auto& ext : RegisteredExtensions()) {
+        auto path = L"Software\\Classes\\" + ext;
+        if (ToLowerW(ReadReg(HKEY_CURRENT_USER, path)) == L"echovaultopen") {
+            auto backup = ReadReg(HKEY_CURRENT_USER, kIntegration + L"\\" + ext, L"ProgID");
+            if (backup.empty()) DeleteRegValue(path, nullptr);
+            else WriteReg(path, nullptr, backup);
+        }
+    }
+    const std::wstring path = L"Software\\Classes\\*\\shell\\open\\command";
+    auto cmd = ToLowerW(ReadReg(HKEY_CURRENT_USER, path));
+    if (cmd.find(L"echovault.exe") != std::wstring::npos && cmd.find(L"--open") != std::wstring::npos) {
+        auto backup = ReadReg(HKEY_CURRENT_USER, kIntegration + L"\\*", L"Command");
+        if (backup.empty()) DeleteRegValue(path, nullptr);
+        else WriteReg(path, nullptr, backup);
+    }
     RemoveTaskByName(L"EchoVaultWatcher");
     RemoveTaskByName(L"EchoVaultGuard");
-}
-
-// Installs / removes the logon auto-start entry for the watcher, plus
-// the self-healing scheduled task (see above).
-static void SetWatcherAutoStart(bool enable)
-{
-    HKEY h = nullptr;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER,
-            L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
-            0, KEY_SET_VALUE, &h) == ERROR_SUCCESS)
-    {
-        if (enable)
-        {
-            std::wstring cmd = L"\"" + GetExePath() + L"\" --watch";
-            RegSetValueExW(h, kWatcherRunValue, 0, REG_SZ,
-                reinterpret_cast<const BYTE*>(cmd.c_str()),
-                static_cast<DWORD>((cmd.size() + 1) * sizeof(wchar_t)));
-        }
-        else
-        {
-            RegDeleteValueW(h, kWatcherRunValue);
-        }
-        RegCloseKey(h);
-    }
-
-    if (enable)
-        RegisterWatcherTask();
-    else
-        RemoveWatcherTask();
-}
-
-// Takes over interception for a single extension, backing up whatever
-// was there before. Used when a file is encrypted so ANY file type is
-// covered immediately (even ones not in the static list).
-static bool FindOriginalHandler(
-    const std::wstring& ext, std::wstring& outProgId, std::wstring& outCommand);
-
-void EnsureExtensionIntercepted(const std::wstring& extIn)
-{
-    std::wstring ext = extIn;
-    if (ext.empty() || ext[0] != L'.') return;
-    ext = ToLowerW(ext);
-
-    // First encryption anywhere: install the full interception set.
-    if (!IsOpenInterceptionInstalled())
-        InstallOpenInterception();
-
-    // Already covered (installed list or a previous per-file takeover)?
-    std::wstring bkKey = L"Software\\EchoVault\\OpenInterception\\" + ext;
-    HKEY hBk = nullptr;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, bkKey.c_str(), 0, KEY_READ, &hBk) == ERROR_SUCCESS)
-    {
-        RegCloseKey(hBk);
-        return;
-    }
-
-    // Take over this specific extension now.
-    std::wstring progId, command;
-    FindOriginalHandler(ext, progId, command);
-
-    HKEY hExt = nullptr;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, bkKey.c_str(), 0, nullptr,
-            REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &hExt, nullptr) == ERROR_SUCCESS)
-    {
-        if (!progId.empty())
-            RegSetValueExW(hExt, L"ProgID", 0, REG_SZ,
-                reinterpret_cast<const BYTE*>(progId.c_str()),
-                static_cast<DWORD>((progId.size() + 1) * sizeof(wchar_t)));
-        if (!command.empty())
-            RegSetValueExW(hExt, L"Command", 0, REG_SZ,
-                reinterpret_cast<const BYTE*>(command.c_str()),
-                static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t)));
-        RegCloseKey(hExt);
-    }
-
-    std::wstring clsKey = L"Software\\Classes\\" + ext;
-    HKEY hCls = nullptr;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, clsKey.c_str(), 0, nullptr,
-            REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &hCls, nullptr) == ERROR_SUCCESS)
-    {
-        RegSetValueExW(hCls, nullptr, 0, REG_SZ,
-            reinterpret_cast<const BYTE*>(L"EchoVaultOpen"),
-            static_cast<DWORD>((wcslen(L"EchoVaultOpen") + 1) * sizeof(wchar_t)));
-        RegCloseKey(hCls);
-    }
-
-    std::wstring owpKey = clsKey + L"\\OpenWithProgids";
-    HKEY hOwp = nullptr;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, owpKey.c_str(), 0, nullptr,
-            REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &hOwp, nullptr) == ERROR_SUCCESS)
-    {
-        RegSetValueExW(hOwp, L"EchoVaultOpen", 0, REG_SZ,
-            reinterpret_cast<const BYTE*>(L""), 2);
-        RegCloseKey(hOwp);
-    }
-
-    DeleteUserChoiceForExt(ext);
-    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
-
-    // Make sure the background watcher is defending this (and every)
-    // extension against future "Open with" overrides.
-    StartAssocWatcher();
-}
-
-// Returns the ProgID and shell\open\command registered for an extension,
-// skipping EchoVault's own ProgID so we always find the "real" handler.
-static bool FindOriginalHandler(
-    const std::wstring& ext,
-    std::wstring& outProgId,
-    std::wstring& outCommand)
-{
-    outProgId.clear();
-    outCommand.clear();
-
-    // 1) Default ProgID of the extension
-    HKEY hK = nullptr;
-    if (RegOpenKeyExW(HKEY_CLASSES_ROOT, ext.c_str(), 0, KEY_READ, &hK) == ERROR_SUCCESS)
-    {
-        wchar_t buf[1024] = L"";
-        DWORD sz = sizeof(buf), type = 0;
-        if (RegQueryValueExW(hK, nullptr, nullptr, &type,
-                reinterpret_cast<BYTE*>(buf), &sz) == ERROR_SUCCESS && sz > sizeof(wchar_t))
-            outProgId = buf;
-        RegCloseKey(hK);
-    }
-
-    // 2) Fall back to the first OpenWithProgids entry
-    if (outProgId.empty())
-    {
-        std::wstring sub = ext + L"\\OpenWithProgids";
-        if (RegOpenKeyExW(HKEY_CLASSES_ROOT, sub.c_str(), 0, KEY_READ, &hK) == ERROR_SUCCESS)
-        {
-            wchar_t name[256];
-            DWORD nsz = 256;
-            for (DWORD i = 0;
-                 RegEnumValueW(hK, i, name, &nsz, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS;
-                 i++)
-            {
-                if (lstrcmpiW(name, L"EchoVaultOpen") != 0) { outProgId = name; break; }
-                nsz = 256;
-            }
-            RegCloseKey(hK);
-        }
-    }
-
-    // 2b) Fall back to the user's explicit "Open with" choice, if any.
-    //     (Extensions that were only ever opened via "Open with" have no
-    //     HKCR default at all - only a UserChoice entry.)
-    if (outProgId.empty())
-    {
-        std::wstring sub = L"Software\\Microsoft\\Windows\\CurrentVersion\\"
-                           L"Explorer\\FileExts\\" + ext + L"\\UserChoice";
-        if (RegOpenKeyExW(HKEY_CURRENT_USER, sub.c_str(), 0, KEY_READ, &hK) == ERROR_SUCCESS)
-        {
-            wchar_t buf[1024] = L"";
-            DWORD sz = sizeof(buf), type = 0;
-            if (RegQueryValueExW(hK, L"ProgId", nullptr, &type,
-                    reinterpret_cast<BYTE*>(buf), &sz) == ERROR_SUCCESS && sz > sizeof(wchar_t))
-                outProgId = buf;
-            RegCloseKey(hK);
-        }
-    }
-
-    if (lstrcmpiW(outProgId.c_str(), L"EchoVaultOpen") == 0)
-        outProgId.clear();
-    if (outProgId.empty())
-        return false;
-
-    // 3) shell\open\command of the ProgID
-    // (Paths here are relative to HKEY_CLASSES_ROOT, which is the
-    // merged Software\Classes view - NOT prefixed with Software\Classes.)
-    std::wstring cmdKey = outProgId + L"\\shell\\open\\command";
-    if (RegOpenKeyExW(HKEY_CLASSES_ROOT, cmdKey.c_str(), 0, KEY_READ, &hK) == ERROR_SUCCESS)
-    {
-        wchar_t buf[4096] = L"";
-        DWORD sz = sizeof(buf), type = 0;
-        if (RegQueryValueExW(hK, nullptr, nullptr, &type,
-                reinterpret_cast<BYTE*>(buf), &sz) == ERROR_SUCCESS && sz > sizeof(wchar_t))
-            outCommand = buf;
-        RegCloseKey(hK);
-    }
-
-    return !outCommand.empty();
-}
-
-bool IsOpenInterceptionInstalled()
-{
-    HKEY hK = nullptr;
-    LONG r = RegOpenKeyExW(HKEY_CURRENT_USER,
-        L"Software\\EchoVault\\OpenInterception", 0, KEY_READ, &hK);
-    if (r == ERROR_SUCCESS) RegCloseKey(hK);
-    return r == ERROR_SUCCESS;
-}
-
-bool UninstallOpenInterception()
-{
-    // Delete our ProgID entirely
-    RegDeleteTreeW(HKEY_CURRENT_USER, L"Software\\Classes\\EchoVaultOpen");
-
-    // --- Special case: the "*" (All Files) handler. ---
-    // (The generic loop below skips it because we never set a default
-    // value on the "*" key itself.)
-    {
-        std::wstring backupCmd;
-        HKEY hExt = nullptr;
-        if (RegOpenKeyExW(HKEY_CURRENT_USER,
-                L"Software\\EchoVault\\OpenInterception\\*",
-                0, KEY_READ, &hExt) == ERROR_SUCCESS)
-        {
-            wchar_t buf[4096] = L"";
-            DWORD sz = sizeof(buf), type = 0;
-            if (RegQueryValueExW(hExt, L"Command", nullptr, &type,
-                    reinterpret_cast<BYTE*>(buf), &sz) == ERROR_SUCCESS)
-                backupCmd = buf;
-            RegCloseKey(hExt);
-        }
-
-        // Only remove the override if it is still ours.
-        std::wstring cur;
-        HKEY hCur = nullptr;
-        if (RegOpenKeyExW(HKEY_CURRENT_USER,
-                L"Software\\Classes\\*\\shell\\open\\command",
-                0, KEY_READ, &hCur) == ERROR_SUCCESS)
-        {
-            wchar_t buf[4096] = L"";
-            DWORD sz = sizeof(buf), type = 0;
-            if (RegQueryValueExW(hCur, nullptr, nullptr, &type,
-                    reinterpret_cast<BYTE*>(buf), &sz) == ERROR_SUCCESS)
-                cur = buf;
-            RegCloseKey(hCur);
-        }
-
-        if (cur.find(L"--open") != std::wstring::npos)
-        {
-            RegDeleteTreeW(HKEY_CURRENT_USER,
-                L"Software\\Classes\\*\\shell\\open");
-            if (!backupCmd.empty())
-            {
-                HKEY hCmd = nullptr;
-                if (RegCreateKeyExW(HKEY_CURRENT_USER,
-                        L"Software\\Classes\\*\\shell\\open\\command",
-                        0, nullptr, REG_OPTION_NON_VOLATILE, KEY_WRITE,
-                        nullptr, &hCmd, nullptr) == ERROR_SUCCESS)
-                {
-                    RegSetValueExW(hCmd, nullptr, 0, REG_SZ,
-                        reinterpret_cast<const BYTE*>(backupCmd.c_str()),
-                        static_cast<DWORD>((backupCmd.size() + 1) * sizeof(wchar_t)));
-                    RegCloseKey(hCmd);
-                }
-            }
-        }
-    }
-
-    // Restore every extension we took over
-    HKEY hBase = nullptr;
-    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\EchoVault\\OpenInterception",
-            0, KEY_READ, &hBase) == ERROR_SUCCESS)
-    {
-        wchar_t name[128];
-        DWORD nsz = 128;
-        for (DWORD i = 0;
-             RegEnumKeyExW(hBase, i, name, &nsz, nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS;
-             i++)
-        {
-            std::wstring ext = name;
-
-            // Backup ProgID we saved at install time
-            std::wstring backupProgId;
-            HKEY hExt = nullptr;
-            std::wstring key = std::wstring(L"Software\\EchoVault\\OpenInterception\\") + ext;
-            if (RegOpenKeyExW(HKEY_CURRENT_USER, key.c_str(), 0, KEY_READ, &hExt) == ERROR_SUCCESS)
-            {
-                wchar_t buf[1024] = L"";
-                DWORD sz = sizeof(buf), type = 0;
-                if (RegQueryValueExW(hExt, L"ProgID", nullptr, &type,
-                        reinterpret_cast<BYTE*>(buf), &sz) == ERROR_SUCCESS)
-                    backupProgId = buf;
-                RegCloseKey(hExt);
-            }
-
-            // Only touch the extension if we still own it
-            std::wstring clsKey = L"Software\\Classes\\" + ext;
-            std::wstring curDefault;
-            HKEY hCur = nullptr;
-            if (RegOpenKeyExW(HKEY_CURRENT_USER, clsKey.c_str(), 0, KEY_READ, &hCur) == ERROR_SUCCESS)
-            {
-                wchar_t buf[128] = L"";
-                DWORD sz = sizeof(buf), type = 0;
-                if (RegQueryValueExW(hCur, nullptr, nullptr, &type,
-                        reinterpret_cast<BYTE*>(buf), &sz) == ERROR_SUCCESS)
-                    curDefault = buf;
-                RegCloseKey(hCur);
-            }
-
-            if (lstrcmpiW(curDefault.c_str(), L"EchoVaultOpen") == 0)
-            {
-                RegDeleteTreeW(HKEY_CURRENT_USER, clsKey.c_str());
-                if (!backupProgId.empty())
-                {
-                    HKEY hCls = nullptr;
-                    if (RegCreateKeyExW(HKEY_CURRENT_USER, clsKey.c_str(), 0, nullptr,
-                            REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &hCls, nullptr) == ERROR_SUCCESS)
-                    {
-                        RegSetValueExW(hCls, nullptr, 0, REG_SZ,
-                            reinterpret_cast<const BYTE*>(backupProgId.c_str()),
-                            static_cast<DWORD>((backupProgId.size() + 1) * sizeof(wchar_t)));
-                        RegCloseKey(hCls);
-                    }
-                }
-            }
-            // else: the user changed the association themselves after install
-            //       \u2014 leave their choice alone.
-
-            nsz = 128;
-        }
-        RegCloseKey(hBase);
-    }
-
-    // Remove all of our bookkeeping
-    RegDeleteTreeW(HKEY_CURRENT_USER, L"Software\\EchoVault\\OpenInterception");
-
-    // Stop the background watcher and its logon auto-start entry.
-    SetWatcherAutoStart(false);
+    DeleteRegValue(L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", L"EchoVaultAssocWatcher");
     StopAssocWatcher();
-
-    // Tell the shell to re-read associations right away.
-    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
-
-    return true;
 }
-
 bool InstallOpenInterception()
 {
-    std::wstring exe = GetExePath();
-    if (exe.empty()) return false;
-
-    // Start from a clean slate so the backups stay consistent
-    UninstallOpenInterception();
-
-    std::wstring handlerCmd = L"\"" + exe + L"\" --open \"%1\"";
-
-    HKEY hBase = nullptr;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\EchoVault\\OpenInterception",
-            0, nullptr, REG_OPTION_NON_VOLATILE, KEY_WRITE,
-            nullptr, &hBase, nullptr) != ERROR_SUCCESS)
-        return false;
-
-    int done = 0;
-
-    auto exts = AllInterceptExts();
-    for (auto& ext : exts)
-    {
-        std::wstring progId, command;
-        if (!FindOriginalHandler(ext, progId, command))
-            continue;
-
-        // --- Back up the original handler ---
-        HKEY hExt = nullptr;
-        std::wstring key = L"Software\\EchoVault\\OpenInterception\\" + ext;
-        if (RegCreateKeyExW(HKEY_CURRENT_USER, key.c_str(), 0, nullptr,
-                REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &hExt, nullptr) != ERROR_SUCCESS)
-            continue;
-        RegSetValueExW(hExt, L"ProgID", 0, REG_SZ,
-            reinterpret_cast<const BYTE*>(progId.c_str()),
-            static_cast<DWORD>((progId.size() + 1) * sizeof(wchar_t)));
-        RegSetValueExW(hExt, L"Command", 0, REG_SZ,
-            reinterpret_cast<const BYTE*>(command.c_str()),
-            static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t)));
-
-        // Also remember the user's explicit "Open with" choice so uninstall
-        // can put things back as close as possible.
-        {
-            std::wstring ucPath =
-                L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\"
-                L"FileExts\\" + ext + L"\\UserChoice";
-            std::wstring ucProgId;
-            HKEY hUc = nullptr;
-            if (RegOpenKeyExW(HKEY_CURRENT_USER, ucPath.c_str(), 0, KEY_READ, &hUc) == ERROR_SUCCESS)
-            {
-                wchar_t buf[1024] = L"";
-                DWORD sz = sizeof(buf), type = 0;
-                if (RegQueryValueExW(hUc, L"ProgId", nullptr, &type,
-                        reinterpret_cast<BYTE*>(buf), &sz) == ERROR_SUCCESS && sz > sizeof(wchar_t))
-                    ucProgId = buf;
-                RegCloseKey(hUc);
-            }
-            if (!ucProgId.empty())
-                RegSetValueExW(hExt, L"UserChoice", 0, REG_SZ,
-                    reinterpret_cast<const BYTE*>(ucProgId.c_str()),
-                    static_cast<DWORD>((ucProgId.size() + 1) * sizeof(wchar_t)));
-        }
-        RegCloseKey(hExt);
-
-        // --- Make EchoVault the default handler ---
-        std::wstring clsKey = L"Software\\Classes\\" + ext;
-        HKEY hCls = nullptr;
-        if (RegCreateKeyExW(HKEY_CURRENT_USER, clsKey.c_str(), 0, nullptr,
-                REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &hCls, nullptr) == ERROR_SUCCESS)
-        {
-            std::wstring prog = L"EchoVaultOpen";
-            RegSetValueExW(hCls, nullptr, 0, REG_SZ,
-                reinterpret_cast<const BYTE*>(prog.c_str()),
-                static_cast<DWORD>((prog.size() + 1) * sizeof(wchar_t)));
-            RegCloseKey(hCls);
-        }
-
-        std::wstring owpKey = clsKey + L"\\OpenWithProgids";
-        HKEY hOwp = nullptr;
-        if (RegCreateKeyExW(HKEY_CURRENT_USER, owpKey.c_str(), 0, nullptr,
-                REG_OPTION_NON_VOLATILE, KEY_WRITE, nullptr, &hOwp, nullptr) == ERROR_SUCCESS)
-        {
-            std::wstring prog = L"EchoVaultOpen";
-            RegSetValueExW(hOwp, prog.c_str(), 0, REG_SZ,
-                reinterpret_cast<const BYTE*>(L""), 2);
-            RegCloseKey(hOwp);
-        }
-
-        // UserChoice overrides the default ProgID above - remove it so our
-        // mapping is authoritative and double-clicks actually reach us.
-        DeleteUserChoiceForExt(ext);
-
-        done++;
-    }
-
-    // --- All Files (*) fallback: catches every extension that has no
-    // specific registered handler (e.g. many code files) so "any file"
-    // is intercepted. ---
-    {
-        std::wstring starCmd;
-        HKEY hK = nullptr;
-        if (RegOpenKeyExW(HKEY_CLASSES_ROOT, L"*\\shell\\open\\command",
-                0, KEY_READ, &hK) == ERROR_SUCCESS)
-        {
-            wchar_t buf[4096] = L"";
-            DWORD sz = sizeof(buf), type = 0;
-            if (RegQueryValueExW(hK, nullptr, nullptr, &type,
-                    reinterpret_cast<BYTE*>(buf), &sz) == ERROR_SUCCESS)
-                starCmd = buf;
-            RegCloseKey(hK);
-        }
-
-        // Back up whatever was there before us.
-        HKEY hExt = nullptr;
-        if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\EchoVault\\OpenInterception\\*",
-                0, nullptr, REG_OPTION_NON_VOLATILE, KEY_WRITE,
-                nullptr, &hExt, nullptr) == ERROR_SUCCESS)
-        {
-            if (!starCmd.empty())
-                RegSetValueExW(hExt, L"Command", 0, REG_SZ,
-                    reinterpret_cast<const BYTE*>(starCmd.c_str()),
-                    static_cast<DWORD>((starCmd.size() + 1) * sizeof(wchar_t)));
-            RegCloseKey(hExt);
-        }
-
-        // Make EchoVault the open command for all files.
-        HKEY hCmd = nullptr;
-        if (RegCreateKeyExW(HKEY_CURRENT_USER,
-                L"Software\\Classes\\*\\shell\\open\\command",
-                0, nullptr, REG_OPTION_NON_VOLATILE, KEY_WRITE,
-                nullptr, &hCmd, nullptr) == ERROR_SUCCESS)
-        {
-            RegSetValueExW(hCmd, nullptr, 0, REG_SZ,
-                reinterpret_cast<const BYTE*>(handlerCmd.c_str()),
-                static_cast<DWORD>((handlerCmd.size() + 1) * sizeof(wchar_t)));
-            RegCloseKey(hCmd);
-        }
-        done++;
-    }
-
-    // --- The EchoVaultOpen ProgID + its open command ---
-    HKEY hProg = nullptr;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER,
-            L"Software\\Classes\\EchoVaultOpen\\shell\\open\\command",
-            0, nullptr, REG_OPTION_NON_VOLATILE, KEY_WRITE,
-            nullptr, &hProg, nullptr) == ERROR_SUCCESS)
-    {
-        RegSetValueExW(hProg, nullptr, 0, REG_SZ,
-            reinterpret_cast<const BYTE*>(handlerCmd.c_str()),
-            static_cast<DWORD>((handlerCmd.size() + 1) * sizeof(wchar_t)));
-        RegCloseKey(hProg);
-    }
-
-    RegCloseKey(hBase);
-
-    // Tell the shell to re-read associations right away (no logoff needed).
+    RepairScriptAssociations();
+    RestoreLegacyDefaults();
+    std::wstring cmd = L"\"" + GetExePath() + L"\" --open \"%1\"";
+    bool ok = WriteReg(L"Software\\Classes\\EchoVaultOpen", nullptr, L"EchoVault protected file") &&
+        WriteReg(L"Software\\Classes\\EchoVaultOpen\\shell\\open\\command", nullptr, cmd) &&
+        WriteReg(kCapabilities, L"ApplicationName", L"EchoVault") &&
+        WriteReg(kCapabilities, L"ApplicationDescription", L"Password-protected files; no kernel driver") &&
+        WriteReg(L"Software\\RegisteredApplications", L"EchoVault", kCapabilities) &&
+        WriteReg(kIntegration, L"Mode", L"UserChoice");
+    for (const auto* ext : kCommonExtensions) ok = RegisterExtension(ext) && ok;
+    for (const auto& ext : RegisteredExtensions()) ok = RegisterExtension(ext) && ok;
     SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
-
-    if (done == 0)
-        return false;
-
-    // Start the background watcher (re-asserts our mapping against
-    // future "Open with" overrides) and autostart it at logon.
-    SetWatcherAutoStart(true);
-    StartAssocWatcher();
-
+    return ok;
+}
+bool UninstallOpenInterception()
+{
+    RepairScriptAssociations();
+    RestoreLegacyDefaults();
+    for (const auto& ext : RegisteredExtensions())
+        DeleteRegValue(L"Software\\Classes\\" + ext + L"\\OpenWithProgids", L"EchoVaultOpen");
+    DeleteRegValue(L"Software\\RegisteredApplications", L"EchoVault");
+    RegDeleteTreeW(HKEY_CURRENT_USER, kCapabilities.c_str());
+    RegDeleteTreeW(HKEY_CURRENT_USER, kIntegration.c_str());
+    RegDeleteTreeW(HKEY_CURRENT_USER, L"Software\\Classes\\EchoVaultOpen");
+    RegDeleteTreeW(HKEY_CURRENT_USER, L"Software\\Classes\\*\\shell\\EchoVault");
+    RegDeleteTreeW(HKEY_CURRENT_USER, L"Software\\Classes\\Directory\\shell\\EchoVault");
+    RegDeleteTreeW(HKEY_CURRENT_USER, L"Software\\Classes\\*\\shell\\EchoVaultOpen");
+    SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, nullptr, nullptr);
     return true;
 }
-
 void ManageOpenInterception()
 {
-    if (IsOpenInterceptionInstalled())
-    {
-        int r = MessageBoxW(nullptr,
-            L"Open interception is currently installed.\n\n"
-            L"When you double-click an encrypted file, EchoVault asks for its\n"
-            L"password, unlocks it and opens it in the normal program.\n"
-            L"Plain files still open directly.\n\n"
-            L"Uninstall it now?",
-            L"EchoVault \u2014 Open Interception",
-            MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
-        if (r == IDYES)
-        {
-            if (UninstallOpenInterception())
-                ShowInfo(L"EchoVault",
-                    L"Open interception removed. Original file associations restored.");
-            else
-                ShowError(L"EchoVault",
-                    L"Failed to fully remove open interception.");
-        }
-        return;
+    bool firstSetup = !IsOpenInterceptionInstalled();
+    if (firstSetup) {
+        if (MessageBoxW(nullptr,
+            L"Enable EchoVault's right-click actions and make it available in Windows Default Apps?\n\n"
+            L"This does not load a driver or change your current default apps. "
+            L"You choose the types that open with EchoVault in Windows Settings.",
+            L"EchoVault - Explorer setup", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) return;
     }
-
-    auto allExts = AllInterceptExts();
-    std::wstring exts;
-    size_t shown = 0;
-    for (auto& e : allExts)
-    {
-        if (shown >= 24)
-        {
-            exts += L"... and " + std::to_wstring(allExts.size() - shown) + L" more";
-            break;
-        }
-        if (shown > 0 && shown % 8 == 0) exts += L"\n";
-        exts += e;
-        exts += L" ";
-        shown++;
+    // Refresh an existing beta installation as well. Earlier builds registered
+    // only .txt, so merely opening this screen must add the complete list.
+    if (!InstallOpenInterception() || (firstSetup && !InstallRegistryHooks())) {
+        ShowError(L"EchoVault", L"Explorer setup could not be completed."); return;
     }
-
-    std::wstring msg =
-        L"Install open interception (auto-unlock)?\n\n"
-        L"EchoVault will intercept opening of these types (plus ANY file\n"
-        L"type that has no other registered program):\n\n" +
-        exts + L"\n\n"
-        L"Double-clicking an encrypted file will prompt for its password,\n"
-        L"unlock it, and open it normally. Plain files are unaffected.\n"
-        L"Add more types later with: EchoVault.exe --add-ext .xyz\n"
-        L"Original associations are backed up and restored on uninstall.";
-    int r = MessageBoxW(nullptr, msg.c_str(),
-        L"EchoVault \u2014 Open Interception",
-        MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
-    if (r != IDYES)
-        return;
-
-    if (InstallOpenInterception())
-        ShowInfo(L"EchoVault", L"Open interception installed successfully!");
-    else
-        ShowError(L"EchoVault", L"Open interception could not be installed.");
+    ReassertInterception();
+    auto text = AssociationStatus() + L"\n\nOpen Windows Default Apps now?";
+    WriteReg(kIntegration, L"SettingsOffered", L"1");
+    if (MessageBoxW(nullptr, text.c_str(), L"EchoVault - Explorer status",
+            MB_YESNO | MB_ICONINFORMATION | MB_DEFBUTTON2) == IDYES)
+        ShellExecuteW(nullptr, L"open", L"ms-settings:defaultapps?registeredAppUser=EchoVault",
+                      nullptr, nullptr, SW_SHOWNORMAL);
 }
 
 // Substitute %1/%L with the quoted file path, expand env vars, and drop
@@ -1996,8 +1146,9 @@ static std::wstring SubstituteArgs(
     std::wstring exp;
     if (n > 1)
     {
-        exp.resize(n - 1);
+        exp.resize(n);
         ExpandEnvironmentStringsW(command.c_str(), &exp[0], n);
+        exp.resize(n - 1);
     }
     else
     {
@@ -2118,15 +1269,18 @@ unsigned long OpenWithOriginalApp(const std::filesystem::path& filePath,
     {
         if (!FindOriginalHandler(ext, progId, command) || command.empty())
         {
-            // No registered program for this file type: show the standard
-            // Windows "How do you want to open this file?" picker, exactly
-            // as a normal double-click would.
-            SHELLEXECUTEINFOW sei = {};
-            sei.cbSize = sizeof(sei);
-            sei.lpVerb = L"openas";
-            sei.lpFile = filePath.c_str();
-            sei.nShow  = SW_SHOWNORMAL;
-            ShellExecuteExW(&sei);
+            // SHOpenWithDialog is modal. OAIF_EXEC waits for the user's
+            // selection before starting that app, so EchoVault's later
+            // "save, close, then lock" dialog cannot race ahead of it.
+            OPENASINFO info = {};
+            info.pcszFile = filePath.c_str();
+            info.pcszClass = nullptr;
+            info.oaifInFlags = OAIF_EXEC;
+            if (SUCCEEDED(SHOpenWithDialog(nullptr, &info)))
+                return 1; // launched, but Windows does not expose a useful PID
+            ShowError(L"EchoVault",
+                L"No application was selected. The file remains unlocked until "
+                L"you confirm re-locking.");
             return 0;
         }
     }

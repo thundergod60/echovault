@@ -13,7 +13,7 @@
 ;----------------------------------------------------------------------------
 
 #define MyAppName    "EchoVault"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.1.0-beta.1"
 #define MyAppExeName "EchoVault.exe"
 
 [Setup]
@@ -21,7 +21,7 @@ AppId=0C1A2B3C-4D5E-4F6A-8B9C-0D1E2F3A4B5C
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher=Thundercloud
-DefaultDirName={autopf}\{#MyAppName}
+DefaultDirName={localappdata}\Programs\{#MyAppName}
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 UninstallDisplayIcon={app}\{#MyAppExeName}
@@ -29,9 +29,9 @@ UninstallDisplayName={#MyAppName}
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
-PrivilegesRequired=high
+PrivilegesRequired=lowest
 OutputDir=output
-OutputBaseFilename=EchoVault-Setup
+OutputBaseFilename=EchoVault-1.1.0-beta.1-Setup
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -44,6 +44,7 @@ Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription
 ; runs the association cleanup below; [UninstallDelete] removes it after.
 Source: "EchoVault.exe"; DestDir: "{app}"; Flags: ignoreversion uninsneveruninstall
 Source: "README.txt";     DestDir: "{app}"; Flags: ignoreversion
+Source: "RELEASE-NOTES.md"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"

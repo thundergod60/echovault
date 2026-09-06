@@ -40,6 +40,16 @@ std::vector<unsigned char> DecryptBuffer(
     const std::vector<unsigned char>& key
 );
 
+// EVG4 envelope: marker(4), random nonce(12), tag(16), ciphertext.
+// Associated data is authenticated but not encrypted. No CBC fallback is
+// permitted for an envelope that carries this marker.
+std::vector<unsigned char> EncryptAuthenticated(
+    const std::vector<unsigned char>& plain, const std::vector<unsigned char>& key,
+    const std::vector<unsigned char>& associated = {});
+bool DecryptChecked(const std::vector<unsigned char>& data,
+    const std::vector<unsigned char>& key, std::vector<unsigned char>& plain,
+    const std::vector<unsigned char>& associated = {}, bool requireAuthenticated = false);
+
 // Hex conversions for recovery key display / input.
 std::wstring BytesToHex(const std::vector<unsigned char>& bytes);
 std::vector<unsigned char> HexToBytes(const std::wstring& hex);

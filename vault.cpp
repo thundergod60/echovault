@@ -43,8 +43,62 @@ static fs::path TempPathFor(const fs::path& filePath)
 {
     fs::path tmp = filePath;
     tmp += L".evtmp.";
-    tmp += std::to_wstring(GetCurrentProcessId());
+    tmp += std::to_wstring(GetCurrentProcessId()) + L"." + BytesToHex(GenerateRandomBytes(16));
     return tmp;
+}
+
+// Locked files deliberately keep their original extension. If Windows
+// bypasses EchoVault through "Open with", an ordinary editor may display the
+// ciphertext as garbage. Marking the locked file read-only does not provide a
+// security boundary (the owner can remove the attribute), but it prevents the
+// common and destructive accident of pressing Save over the encrypted data.
+// EchoVault clears the attribute only for its atomic replacement and restores
+// it whenever the result is encrypted.
+static bool ReplaceAtomically(const fs::path& tempPath,
+                              const fs::path& destination,
+                              bool resultIsEncrypted)
+{
+    // Flush the complete temporary file before committing the rename.
+    HANDLE h = CreateFileW(tempPath.c_str(), GENERIC_WRITE, 0, nullptr,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    bool flushed = FlushFileBuffers(h) != FALSE;
+    CloseHandle(h);
+    if (!flushed) return false;
+    DWORD tempAttrs = GetFileAttributesW(tempPath.c_str());
+    if (tempAttrs == INVALID_FILE_ATTRIBUTES) return false;
+    DWORD wanted = resultIsEncrypted ? tempAttrs | FILE_ATTRIBUTE_READONLY
+                                    : tempAttrs & ~FILE_ATTRIBUTE_READONLY;
+    if (!SetFileAttributesW(tempPath.c_str(), wanted)) return false;
+    DWORD oldAttrs = GetFileAttributesW(destination.c_str());
+    bool hadAttrs = oldAttrs != INVALID_FILE_ATTRIBUTES;
+    if (hadAttrs && (oldAttrs & FILE_ATTRIBUTE_READONLY))
+    {
+        if (!SetFileAttributesW(destination.c_str(),
+                oldAttrs & ~FILE_ATTRIBUTE_READONLY))
+        {
+            SetFileAttributesW(tempPath.c_str(), tempAttrs);
+            return false;
+        }
+    }
+
+    if (!MoveFileExW(tempPath.c_str(), destination.c_str(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+    {
+        if (hadAttrs && (oldAttrs & FILE_ATTRIBUTE_READONLY))
+            SetFileAttributesW(destination.c_str(), oldAttrs);
+        SetFileAttributesW(tempPath.c_str(), tempAttrs);
+        return false;
+    }
+
+    return true;
+}
+
+static bool IsReadOnlyFile(const fs::path& path)
+{
+    DWORD attrs = GetFileAttributesW(path.c_str());
+    return attrs != INVALID_FILE_ATTRIBUTES &&
+           (attrs & FILE_ATTRIBUTE_READONLY) != 0;
 }
 
 std::filesystem::path GetVaultDirectory()
@@ -93,10 +147,18 @@ bool ValidateVaultHeader(const VaultHeader& h)
 bool SaveVaultHeader(const VaultHeader& header)
 {
     try {
-        std::ofstream f(g_VaultDB, std::ios::binary | std::ios::trunc);
+        GetVaultDirectory();
+        fs::path tmp = TempPathFor(g_VaultDB);
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
         if (!f) return false;
         f.write(reinterpret_cast<const char*>(&header), sizeof(VaultHeader));
-        return f.good();
+        f.flush();
+        bool good = f.good();
+        f.close();
+        if (good && ReplaceAtomically(tmp, g_VaultDB, false)) return true;
+        std::error_code ec;
+        fs::remove(tmp, ec);
+        return false;
     } catch (...) {
         return false;
     }
@@ -181,8 +243,8 @@ bool FirstRunWizard()
     std::wstring recHex = BytesToHex(recoveryKey);
     auto recKey = DeriveKey(recHex, recSalt);
 
-    auto encMK    = EncryptBuffer(masterKey, pwKey);
-    auto encMKRec = EncryptBuffer(masterKey, recKey);
+    auto encMK    = EncryptAuthenticated(masterKey, pwKey);
+    auto encMKRec = EncryptAuthenticated(masterKey, recKey);
 
     if (pwHash.empty() || pwKey.empty() || recKey.empty() ||
         encMK.size() != 64 || encMKRec.size() != 64)
@@ -259,7 +321,7 @@ bool ChangeMasterPassword(VaultHeader& hdr, const std::vector<unsigned char>& ma
 
     auto newHash = HashPassword(newPw, newSalt);
     auto newKey  = DeriveKey(newPw, newSalt);
-    auto newEnc  = EncryptBuffer(masterKey, newKey);
+    auto newEnc  = EncryptAuthenticated(masterKey, newKey);
 
     if (newHash.empty() || newKey.empty() || newEnc.size() != 64) {
         ShowError(L"EchoVault", L"Failed to re-encrypt with new password.");
@@ -365,23 +427,35 @@ enum class EvHeaderState
 // be excluded from the encrypted-content size regardless of validity).
 static EvHeaderState ReadEvHeader(const fs::path& filePath,
                                   EvFileHeader& out,
-                                  bool& hasTrailer)
+                                  bool& hasTrailer, bool* authenticated = nullptr)
 {
     hasTrailer = false;
+    if (authenticated) *authenticated = false;
     try
     {
         std::ifstream in(filePath, std::ios::binary | std::ios::ate);
         if (!in) return EvHeaderState::None;
         auto sz = static_cast<size_t>(in.tellg());
-        if (sz < kPrimaryHeaderSize + 16) return EvHeaderState::None;
+        if (sz < kPrimaryHeaderSize + 32) {
+            char marker[4] = {};
+            in.seekg(0); in.read(marker, 4);
+            return std::memcmp(marker, "EVF2", 4) == 0 ||
+                   std::memcmp(marker, "EVF3", 4) == 0 ||
+                   std::memcmp(marker, "EVF4", 4) == 0 ? EvHeaderState::Corrupt : EvHeaderState::None;
+        }
 
         EvFileHeader primary = {};
         in.seekg(0);
         char primMagic[4] = {};
         in.read(primMagic, 4);
         in.read(reinterpret_cast<char*>(&primary), sizeof(primary));
-        bool primaryNew    = (std::memcmp(primMagic, "EVF3", 4) == 0);
+        bool primaryAuth = (std::memcmp(primMagic, "EVF4", 4) == 0);
+        bool primaryNew = primaryAuth || (std::memcmp(primMagic, "EVF3", 4) == 0);
         bool primaryLegacy = (std::memcmp(primMagic, "EVF2", 4) == 0);
+
+        char payloadMarker[4] = {};
+        in.read(payloadMarker, 4);
+        bool payloadAuth = std::memcmp(payloadMarker, "EVG4", 4) == 0;
 
         // Physical trailer region (magic "EVFT") at the very end.
         bool trailerSpace = (sz >= kPrimaryHeaderSize + 16 + kTrailerSize);
@@ -391,8 +465,12 @@ static EvHeaderState ReadEvHeader(const fs::path& filePath,
         {
             in.seekg(static_cast<std::streamoff>(sz) - kTrailerSize);
             in.read(reinterpret_cast<char*>(&trailer), sizeof(trailer));
-            trailerPhys = (std::memcmp(trailer.magic, "EVFT", 4) == 0);
+            trailerPhys = (std::memcmp(trailer.magic, "EVFT", 4) == 0) ||
+                          (std::memcmp(trailer.magic, "EVT4", 4) == 0);
         }
+
+        if (authenticated) *authenticated = primaryAuth || payloadAuth ||
+            (trailerPhys && std::memcmp(trailer.magic, "EVT4", 4) == 0);
 
         // EVF3 files ALWAYS reserve the trailing region for the trailer
         // (even if its magic was damaged), so content size stays correct.
@@ -431,6 +509,12 @@ static EvHeaderState ReadEvHeader(const fs::path& filePath,
             std::memcpy(out.encKeyByPw, trailer.encKeyByPw, 64);
             std::memcpy(out.encKeyByMaster, trailer.encKeyByMaster, 64);
             return EvHeaderState::Backup;
+        }
+        if (payloadAuth && trailerSpace) {
+            // A recognition hint only: GCM must still authenticate the header and data.
+            hasTrailer = true;
+            out = primary;
+            return EvHeaderState::Primary;
         }
         if (trailerPhys)
             return EvHeaderState::Corrupt;
@@ -475,16 +559,16 @@ bool IsEncrypted(const std::filesystem::path& target)
 // encrypted content, then the redundant trailer (backup header + CRCs).
 static bool WriteEvfFile(std::ofstream& out,
                          const EvFileHeader& hdr,
-                         const std::vector<unsigned char>& enc)
+                         const std::vector<unsigned char>& enc, bool authenticated = true)
 {
     EvFileHeader primary = hdr;
-    out.write("EVF3", 4);
+    out.write(authenticated ? "EVF4" : "EVF3", 4);
     out.write(reinterpret_cast<const char*>(&primary), sizeof(primary));
     if (!enc.empty())
         out.write(reinterpret_cast<const char*>(enc.data()), enc.size());
 
     EvTrailer tr = {};
-    std::memcpy(tr.magic, "EVFT", 4);
+    std::memcpy(tr.magic, authenticated ? "EVT4" : "EVFT", 4);
     std::memcpy(tr.salt, hdr.salt, 32);
     std::memcpy(tr.encKeyByPw, hdr.encKeyByPw, 64);
     std::memcpy(tr.encKeyByMaster, hdr.encKeyByMaster, 64);
@@ -493,7 +577,61 @@ static bool WriteEvfFile(std::ofstream& out,
                           sizeof(tr.salt) + sizeof(tr.encKeyByPw) +
                           sizeof(tr.encKeyByMaster));
     out.write(reinterpret_cast<const char*>(&tr), sizeof(tr));
+    out.flush();
     return out.good();
+}
+
+static constexpr size_t kMaxFileBytes = 128u * 1024u * 1024u;
+static bool ReadBounded(const fs::path& path, std::vector<unsigned char>& bytes)
+{
+    // Atomic replacement cannot encrypt other hard-link names or silently drop
+    // named streams. Refuse those cases rather than promise complete protection.
+    DWORD attrs = GetFileAttributesW(path.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_REPARSE_POINT)) return false;
+    HANDLE metadata = CreateFileW(path.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                  nullptr, OPEN_EXISTING, 0, nullptr);
+    if (metadata == INVALID_HANDLE_VALUE) return false;
+    BY_HANDLE_FILE_INFORMATION info = {};
+    bool ordinary = GetFileInformationByHandle(metadata, &info) && info.nNumberOfLinks == 1;
+    CloseHandle(metadata);
+    if (!ordinary) return false;
+    WIN32_FIND_STREAM_DATA stream = {};
+    HANDLE streams = FindFirstStreamW(path.c_str(), FindStreamInfoStandard, &stream, 0);
+    if (streams != INVALID_HANDLE_VALUE) {
+        bool unnamedOnly = true;
+        do {
+            if (wcscmp(stream.cStreamName, L"::$DATA") != 0) unnamedOnly = false;
+        } while (FindNextStreamW(streams, &stream));
+        DWORD end = GetLastError();
+        FindClose(streams);
+        if (!unnamedOnly || end != ERROR_HANDLE_EOF) return false;
+    } else {
+        DWORD error = GetLastError();
+        if (error != ERROR_HANDLE_EOF && error != ERROR_INVALID_FUNCTION &&
+            error != ERROR_NOT_SUPPORTED) return false;
+    }
+    std::ifstream in(path, std::ios::binary | std::ios::ate);
+    auto size = in.tellg();
+    if (!in || size < 0 || size > static_cast<std::streamoff>(kMaxFileBytes)) return false;
+    bytes.resize(static_cast<size_t>(size));
+    in.seekg(0);
+    if (size > 0) in.read(reinterpret_cast<char*>(bytes.data()), size);
+    return in.good();
+}
+static std::vector<unsigned char> HeaderAAD(const EvFileHeader& hdr)
+{
+    const auto* p = reinterpret_cast<const unsigned char*>(&hdr);
+    return std::vector<unsigned char>(p, p + sizeof(hdr));
+}
+// Reading a file and decrypting must succeed completely before any output is written.
+static bool ReadPayload(const fs::path& path, bool trailer, std::vector<unsigned char>& enc)
+{
+    std::vector<unsigned char> bytes;
+    if (!ReadBounded(path, bytes)) return false;
+    size_t overhead = kPrimaryHeaderSize + (trailer ? kTrailerSize : 0);
+    if (bytes.size() < overhead + 32) return false;
+    enc.assign(bytes.begin() + kPrimaryHeaderSize, bytes.end() - (trailer ? kTrailerSize : 0));
+    return true;
 }
 
 // ---- Encrypt a single file in-place (EVF2 format) ---------------
@@ -507,32 +645,28 @@ static bool EncryptSingleFile(
     try {
         if (IsEncrypted(filePath)) return true;
 
-        std::ifstream inFile(filePath, std::ios::binary | std::ios::ate);
-        if (!inFile) return false; // Handle permission issues
-        
-        auto sz = inFile.tellg();
-        inFile.seekg(0);
-        std::vector<unsigned char> plain(static_cast<size_t>(sz));
-        if (sz > 0)
-            inFile.read(reinterpret_cast<char*>(plain.data()), sz);
-        inFile.close();
+        if (fileSalt.size() != 32 || filePasswordKey.size() != 32 || masterKey.size() != 32)
+            return false;
+        std::vector<unsigned char> plain;
+        if (!ReadBounded(filePath, plain) || plain.size() > 127u * 1024u * 1024u) return false;
 
         auto fileKey = GenerateRandomBytes(32);
         if (fileKey.empty()) return false;
 
-        auto encKeyByPw = EncryptBuffer(fileKey, filePasswordKey);
-        auto encKeyByMaster = EncryptBuffer(fileKey, masterKey);
+        auto encKeyByPw = EncryptAuthenticated(fileKey, filePasswordKey);
+        auto encKeyByMaster = EncryptAuthenticated(fileKey, masterKey);
         
         if (encKeyByPw.size() != 64 || encKeyByMaster.size() != 64) {
             return false;
         }
 
-        auto enc = EncryptBuffer(plain, fileKey);
-        if (enc.empty() && sz > 0) return false;
-        if (enc.empty() && sz == 0) {
-            enc = EncryptBuffer({}, fileKey);
-            if (enc.empty()) return false;
-        }
+        EvFileHeader hdr = {};
+        std::memcpy(hdr.salt, fileSalt.data(), 32);
+        std::memcpy(hdr.encKeyByPw, encKeyByPw.data(), 64);
+        std::memcpy(hdr.encKeyByMaster, encKeyByMaster.data(), 64);
+        auto enc = EncryptAuthenticated(plain, fileKey, HeaderAAD(hdr));
+        SecureZeroMemory(plain.data(), plain.size());
+        if (enc.empty()) return false;
 
         // Write atomically: temp file in the same directory, then replace
         // so a crash or full disk never leaves a half-written file.
@@ -541,10 +675,6 @@ static bool EncryptSingleFile(
             std::ofstream outFile(tmpPath, std::ios::binary | std::ios::trunc);
             if (!outFile) return false; // Handle permission issues
 
-            EvFileHeader hdr = {};
-            std::memcpy(hdr.salt, fileSalt.data(), 32);
-            std::memcpy(hdr.encKeyByPw, encKeyByPw.data(), 64);
-            std::memcpy(hdr.encKeyByMaster, encKeyByMaster.data(), 64);
             bool good = WriteEvfFile(outFile, hdr, enc);
             outFile.close();
             if (!good) {
@@ -553,8 +683,7 @@ static bool EncryptSingleFile(
             }
         }
 
-        if (!MoveFileExW(tmpPath.c_str(), filePath.c_str(),
-                         MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        if (!ReplaceAtomically(tmpPath, filePath, true))
         {
             fs::remove(tmpPath);
             return false;
@@ -573,30 +702,17 @@ static int DecryptSingleFile(
     const fs::path& filePath,
     const std::vector<unsigned char>& pwKey, 
     const std::vector<unsigned char>& masterKey,
-    bool usingMasterKey)
+    bool usingMasterKey, bool verifyOnly = false)
 {
     try {
         EvFileHeader hdr;
-        bool hasTrailer = false;
-        EvHeaderState st = ReadEvHeader(filePath, hdr, hasTrailer);
-        if (st == EvHeaderState::None || st == EvHeaderState::Corrupt)
-            return -1;   // not encrypted, or both header copies damaged
-
-        std::ifstream inFile(filePath, std::ios::binary | std::ios::ate);
-        if (!inFile) return -1;
-        auto sz = static_cast<size_t>(inFile.tellg());
-        size_t encSize = sz - kPrimaryHeaderSize - (hasTrailer ? kTrailerSize : 0);
-        if (encSize < 16) return 0;
-
-        inFile.seekg(kPrimaryHeaderSize);
-        std::vector<unsigned char> salt(hdr.salt, hdr.salt + 32);
+        bool hasTrailer = false, authenticated = false;
+        EvHeaderState st = ReadEvHeader(filePath, hdr, hasTrailer, &authenticated);
+        if (st == EvHeaderState::None || st == EvHeaderState::Corrupt) return -1;
+        std::vector<unsigned char> enc;
+        if (!ReadPayload(filePath, hasTrailer, enc)) return 0;
         std::vector<unsigned char> encKeyByPw(hdr.encKeyByPw, hdr.encKeyByPw + 64);
         std::vector<unsigned char> encKeyByMaster(hdr.encKeyByMaster, hdr.encKeyByMaster + 64);
-
-        std::vector<unsigned char> enc(encSize);
-        inFile.read(reinterpret_cast<char*>(enc.data()), encSize);
-        inFile.close();
-
         std::vector<unsigned char> fileKey;
         if (usingMasterKey) {
             fileKey = DecryptBuffer(encKeyByMaster, masterKey);
@@ -606,10 +722,12 @@ static int DecryptSingleFile(
 
         if (fileKey.empty() || fileKey.size() != 32) return 0;
 
-        auto plain = DecryptBuffer(enc, fileKey);
+        std::vector<unsigned char> plain;
+        bool valid = DecryptChecked(enc, fileKey, plain,
+            authenticated ? HeaderAAD(hdr) : std::vector<unsigned char>{}, authenticated);
         SecureZeroMemory(fileKey.data(), fileKey.size());
-
-        if (plain.empty() && encSize > 16) return 0;
+        if (!valid) return 0;
+        if (verifyOnly) { SecureZeroMemory(plain.data(), plain.size()); return 1; }
 
         // Write atomically: temp file in the same directory, then replace.
         fs::path tmpPath = TempPathFor(filePath);
@@ -619,6 +737,7 @@ static int DecryptSingleFile(
             if (!plain.empty())
                 outFile.write(reinterpret_cast<const char*>(plain.data()), plain.size());
 
+            outFile.flush();
             bool good = outFile.good();
             outFile.close();
             if (!good) {
@@ -627,8 +746,7 @@ static int DecryptSingleFile(
             }
         }
 
-        if (!MoveFileExW(tmpPath.c_str(), filePath.c_str(),
-                         MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        if (!ReplaceAtomically(tmpPath, filePath, false))
         {
             fs::remove(tmpPath);
             return 0;
@@ -637,6 +755,28 @@ static int DecryptSingleFile(
         return 1;
     } catch (...) {
         return 0;
+    }
+}
+
+// Refuse links/reparse points and inaccessible entries before a batch starts.
+// This avoids silently declaring success over skipped subfolders or encrypting
+// a linked file outside the selected folder.
+static bool CollectTargetFiles(const fs::path& target, std::vector<fs::path>& files)
+{
+    auto add = [&](const fs::path& path) {
+        DWORD attrs = GetFileAttributesW(path.c_str());
+        if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_REPARSE_POINT))
+            throw std::runtime_error("inaccessible path or link");
+        if (!(attrs & FILE_ATTRIBUTE_DIRECTORY)) files.push_back(path);
+    };
+    try {
+        add(target);
+        if (fs::is_directory(target))
+            for (const auto& entry : fs::recursive_directory_iterator(target)) add(entry.path());
+        return true;
+    } catch (...) {
+        ShowError(L"EchoVault", L"Folder scan failed: inaccessible entries or links were found. Nothing was changed. Select ordinary local files instead.");
+        return false;
     }
 }
 
@@ -651,6 +791,14 @@ bool EncryptTarget(const std::filesystem::path& target)
         return true;
     }
 
+    std::vector<fs::path> targets;
+    if (!CollectTargetFiles(target, targets)) return false;
+    if (MessageBoxW(nullptr,
+        L"Close programs using these files and keep a tested backup before continuing.\n\n"
+        L"Files stay in their current locations and keep their names and extensions. "
+        L"For a folder, only the existing file contents are encrypted; folder names and file names stay visible. "
+        L"New files added later are not automatically encrypted.\n\nContinue?",
+        L"EchoVault - Encrypt", MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) return false;
     std::wstring filePw;
     for (;;)
     {
@@ -678,11 +826,13 @@ bool EncryptTarget(const std::filesystem::path& target)
 
     auto fileSalt = GenerateRandomBytes(32);
     auto pwKey = DeriveKey(filePw, fileSalt);
+    auto master = GetMasterKeyOnDemand();
+    if (master.size() != 32 || fileSalt.size() != 32 || pwKey.size() != 32) return false;
 
     try {
         if (fs::is_regular_file(target)) {
-            if (!EncryptSingleFile(target, pwKey, fileSalt, GetMasterKeyOnDemand())) {
-                ShowError(L"EchoVault", (L"Failed to encrypt (check permissions):\n" + target.wstring()).c_str());
+            if (!EncryptSingleFile(target, pwKey, fileSalt, master)) {
+                ShowError(L"EchoVault", (L"Failed to encrypt. Check free disk space, permissions, open programs, and the 127 MiB file limit:\n" + target.wstring()).c_str());
                 return false;
             }
             // Any encrypted file must be interceptable on double-click:
@@ -696,17 +846,13 @@ bool EncryptTarget(const std::filesystem::path& target)
 
         if (fs::is_directory(target)) {
             int ok = 0, fail = 0;
-            for (auto& entry : fs::recursive_directory_iterator(target,
-                    fs::directory_options::skip_permission_denied))
-            {
-                if (!entry.is_regular_file()) continue;
-                if (IsEncrypted(entry.path())) continue;
-                if (EncryptSingleFile(entry.path(), pwKey, fileSalt, GetMasterKeyOnDemand())) {
+            for (const auto& p : targets) {
+                if (IsEncrypted(p)) continue;
+                if (EncryptSingleFile(p, pwKey, fileSalt, master)) {
                     ++ok;
-                    EnsureExtensionIntercepted(entry.path().extension().wstring());
-                    EvRegister(entry.path().wstring());
-                }
-                else ++fail;
+                    EnsureExtensionIntercepted(p.extension().wstring());
+                    EvRegister(p.wstring());
+                } else ++fail;
             }
             // The folder itself is gated too (prefix entry): opening it
             // (or anything under it) requires a password.
@@ -757,107 +903,60 @@ bool DecryptTarget(const std::filesystem::path& target, bool showResult)
 {
     EvGate gate(target);   // driver: allow reads; re-deny if we bail out
 
-    std::vector<unsigned char> sampleSalt;
-    fs::path firstFile = target;
-    if (fs::is_directory(target)) {
-        for (auto& entry : fs::recursive_directory_iterator(target, fs::directory_options::skip_permission_denied)) {
-            if (entry.is_regular_file() && IsEncrypted(entry.path())) {
-                firstFile = entry.path();
-                break;
-            }
-        }
-    }
-    
-    if (firstFile.empty() || !ExtractSalt(firstFile, sampleSalt)) {
-        ShowError(L"EchoVault", L"No valid EchoVault encrypted files found in the target.");
-        return false;
-    }
-
-    std::vector<unsigned char> pwKey;
-    bool usingMaster = false;
-
-    for (;;) {
-        auto a1 = PromptPassword(
-            L"EchoVault \u2014 File Password",
-            L"Enter the specific password for this file/folder:",
-            true, L"Use Master Password");
-
-        if (a1.result == PasswordResult::Cancel) return false;
-        
-        if (a1.result == PasswordResult::ForgotPassword) {
-            usingMaster = true;
-            break; 
-        }
-
-        pwKey = DeriveKey(a1.password, sampleSalt);
-        
-        // Testing with the file password never needs the master key — only
-        // fetch it when the user explicitly chooses "Use Master Password".
-        int res = DecryptSingleFile(firstFile, pwKey, {}, false);
-        if (res == 1) {
-            usingMaster = false;
-            break;
-        } else if (res == 0) {
-            ShowError(L"EchoVault", L"Incorrect File Password or file corrupted. Try again.");
-            continue;
-        } else {
-            ShowError(L"EchoVault", L"File format corrupted.");
+    try {
+        std::vector<fs::path> files;
+        if (!CollectTargetFiles(target, files)) return false;
+        std::vector<fs::path> encrypted;
+        for (const auto& p : files) if (IsEncrypted(p)) encrypted.push_back(p);
+        if (encrypted.empty()) {
+            ShowError(L"EchoVault", L"No encrypted files found. Nothing was changed.");
             return false;
         }
-    }
-
-    try {
-        if (fs::is_regular_file(target)) {
+        std::vector<unsigned char> sampleSalt;
+        if (!ExtractSalt(encrypted.front(), sampleSalt)) return false;
+        bool usingMaster = false;
+        std::wstring password;
+        std::vector<unsigned char> master;
+        for (;;) {
+            auto answer = PromptPassword(L"EchoVault - Decrypt",
+                L"Enter the file password. Files with other passwords stay encrypted.",
+                true, L"Use Master Password");
+            if (answer.result == PasswordResult::Cancel) return false;
+            usingMaster = answer.result == PasswordResult::ForgotPassword;
             if (usingMaster) {
-                if (DecryptSingleFile(target, pwKey, GetMasterKeyOnDemand(), true) != 1) {
-                    ShowError(L"EchoVault", L"Decryption failed. Check file permissions or Master Key.");
-                    return false;
-                }
-            }
-            EvUnregister(target.wstring());   // driver: permanently un-gate
-            if (showResult)
-                ShowInfo(L"EchoVault", (L"Decrypted successfully:\n" + target.filename().wstring()).c_str());
-            return true;
+                master = GetMasterKeyOnDemand();
+                if (master.size() != 32) return false;
+            } else password = answer.password;
+            auto key = usingMaster ? std::vector<unsigned char>{} : DeriveKey(password, sampleSalt);
+            int result = DecryptSingleFile(encrypted.front(), key, master, usingMaster, true);
+            SecureZeroMemory(key.data(), key.size());
+            if (result == 1) break;
+            ShowError(L"EchoVault", L"Password incorrect, file damaged, or file exceeds the size limit. Nothing was changed.");
+            if (usingMaster) return false;
         }
-
-        if (fs::is_directory(target)) {
-            int ok = 1; 
-            if (usingMaster) {
-                if (DecryptSingleFile(firstFile, pwKey, GetMasterKeyOnDemand(), true) == 1) ok = 1;
-                else ok = 0;
+        int ok = 0, fail = 0;
+        std::wstring failed;
+        for (const auto& p : encrypted) {
+            std::vector<unsigned char> salt;
+            int result = 0;
+            if (ExtractSalt(p, salt)) {
+                auto key = usingMaster ? std::vector<unsigned char>{} : DeriveKey(password, salt);
+                result = DecryptSingleFile(p, key, master, usingMaster);
+                SecureZeroMemory(key.data(), key.size());
             }
-            
-            int fail = 0;
-            std::vector<fs::path> evFiles;
-            for (auto& entry : fs::recursive_directory_iterator(target, fs::directory_options::skip_permission_denied))
-            {
-                if (entry.is_regular_file() && entry.path() != firstFile && IsEncrypted(entry.path()))
-                    evFiles.push_back(entry.path());
-            }
-
-            // The master key is only needed (and only requested) on the
-            // "Use Master Password" path.
-            auto master = usingMaster ? GetMasterKeyOnDemand() : std::vector<unsigned char>{};
-            for (auto& p : evFiles) {
-                if (DecryptSingleFile(p, pwKey, master, usingMaster) == 1) {
-                    ++ok;
-                    EvUnregister(p.wstring());
-                } else ++fail;
-            }
-            EvUnregister(target.wstring());
-
-            std::wstring msg = L"Decryption complete.\n\n"
-                L"Succeeded: " + std::to_wstring(ok) + L"\n"
-                L"Failed: "    + std::to_wstring(fail);
-            if (fail > 0) ShowError(L"EchoVault", msg);
-            else ShowInfo(L"EchoVault", msg);
-            return fail == 0;
+            if (result == 1) { ++ok; EvUnregister(p.wstring()); }
+            else { ++fail; if (fail <= 10) failed += L"\n" + p.wstring(); }
         }
-        return false;
-    } catch (const std::exception& e) {
-        std::string what = e.what();
-        std::wstring wmsg(what.begin(), what.end());
-        ShowError(L"EchoVault", (L"Decryption error:\n" + wmsg).c_str());
+        SecureZeroMemory(password.data(), password.size() * sizeof(wchar_t));
+        SecureZeroMemory(master.data(), master.size());
+        if (fail == 0) EvUnregister(target.wstring());
+        std::wstring message = L"Decryption finished. These files remain unlocked until you encrypt them again.\n\nSucceeded: " +
+            std::to_wstring(ok) + L"\nFailed (unchanged): " + std::to_wstring(fail) + failed;
+        if (fail) ShowError(L"EchoVault", message);
+        else if (showResult) ShowInfo(L"EchoVault", message);
+        return fail == 0;
+    } catch (...) {
+        ShowError(L"EchoVault", L"Could not finish reading the folder. Some files may remain encrypted.");
         return false;
     }
 }
@@ -869,31 +968,15 @@ UnlockResult UnlockFileForOpen(const std::filesystem::path& target)
     UnlockResult out;
     EvGate gate(target);   // driver: allow us to read it; re-deny on failure
 
-    // --- Read the effective header (primary or trailer backup) + content ---
+    EvFileHeader hdr = {};
+    bool hasTrailer = false, authenticated = false;
     std::vector<unsigned char> encContent;
-    try {
-        EvFileHeader hdr;
-        bool hasTrailer = false;
-        EvHeaderState st = ReadEvHeader(target, hdr, hasTrailer);
-        if (st == EvHeaderState::None || st == EvHeaderState::Corrupt)
-            return out;
-
-        std::ifstream in(target, std::ios::binary | std::ios::ate);
-        if (!in) return out;
-        auto sz = static_cast<size_t>(in.tellg());
-        size_t encSize = sz - kPrimaryHeaderSize - (hasTrailer ? kTrailerSize : 0);
-        if (encSize < 16) return out;
-
-        out.salt.assign(hdr.salt, hdr.salt + 32);
-        out.encKeyByPw.assign(hdr.encKeyByPw, hdr.encKeyByPw + 64);
-        out.encKeyByMaster.assign(hdr.encKeyByMaster, hdr.encKeyByMaster + 64);
-
-        in.seekg(kPrimaryHeaderSize);
-        encContent.resize(encSize);
-        in.read(reinterpret_cast<char*>(encContent.data()), encSize);
-    } catch (...) {
-        return out;
-    }
+    auto state = ReadEvHeader(target, hdr, hasTrailer, &authenticated);
+    if (state == EvHeaderState::None || state == EvHeaderState::Corrupt ||
+        !ReadPayload(target, hasTrailer, encContent)) return out;
+    out.salt.assign(hdr.salt, hdr.salt + 32);
+    out.encKeyByPw.assign(hdr.encKeyByPw, hdr.encKeyByPw + 64);
+    out.encKeyByMaster.assign(hdr.encKeyByMaster, hdr.encKeyByMaster + 64);
 
     // --- Password loop (mirrors DecryptTarget for a single file) ---
     bool usingMaster = false;
@@ -935,8 +1018,9 @@ UnlockResult UnlockFileForOpen(const std::filesystem::path& target)
     }
 
     // --- Decrypt the content IN-PLACE (atomic) ---
-    auto plain = DecryptBuffer(encContent, out.fileKey);
-    if (plain.empty() && encContent.size() > 16)
+    std::vector<unsigned char> plain;
+    if (!DecryptChecked(encContent, out.fileKey, plain,
+            authenticated ? HeaderAAD(hdr) : std::vector<unsigned char>{}, authenticated))
     {
         ShowError(L"EchoVault",
             L"Decryption failed. The file may be corrupted.");
@@ -949,12 +1033,12 @@ UnlockResult UnlockFileForOpen(const std::filesystem::path& target)
         if (!o) return out;
         if (!plain.empty())
             o.write(reinterpret_cast<const char*>(plain.data()), plain.size());
+        o.flush();
         bool good = o.good();
         o.close();
         if (!good) { fs::remove(tmpPath); return out; }
     }
-    if (!MoveFileExW(tmpPath.c_str(), target.c_str(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+    if (!ReplaceAtomically(tmpPath, target, false))
     {
         fs::remove(tmpPath);
         return out;
@@ -967,27 +1051,21 @@ UnlockResult UnlockFileForOpen(const std::filesystem::path& target)
 
 bool RelockFile(const std::filesystem::path& target, const UnlockResult& unlock)
 {
-    if (!unlock.success || unlock.fileKey.empty() ||
-        unlock.salt.empty() || unlock.encKeyByPw.empty() || unlock.encKeyByMaster.empty())
+    if (!unlock.success || unlock.fileKey.size() != 32 ||
+        unlock.salt.size() != 32 || unlock.encKeyByPw.size() != 64 || unlock.encKeyByMaster.size() != 64)
         return false;
     if (IsEncrypted(target)) return true;   // already locked again
 
     try {
-        std::ifstream inFile(target, std::ios::binary | std::ios::ate);
-        if (!inFile) return false;
-        auto sz = inFile.tellg();
-        inFile.seekg(0);
-        std::vector<unsigned char> plain(static_cast<size_t>(sz));
-        if (sz > 0)
-            inFile.read(reinterpret_cast<char*>(plain.data()), sz);
-        inFile.close();
-
-        auto enc = EncryptBuffer(plain, unlock.fileKey);
-        if (enc.empty())
-        {
-            if (plain.empty()) enc = EncryptBuffer({}, unlock.fileKey);
-            if (enc.empty()) return false;
-        }
+        std::vector<unsigned char> plain;
+        if (!ReadBounded(target, plain) || plain.size() > 127u * 1024u * 1024u) return false;
+        EvFileHeader hdr = {};
+        std::memcpy(hdr.salt, unlock.salt.data(), 32);
+        std::memcpy(hdr.encKeyByPw, unlock.encKeyByPw.data(), 64);
+        std::memcpy(hdr.encKeyByMaster, unlock.encKeyByMaster.data(), 64);
+        auto enc = EncryptAuthenticated(plain, unlock.fileKey, HeaderAAD(hdr));
+        SecureZeroMemory(plain.data(), plain.size());
+        if (enc.empty()) return false;
 
         // Rebuild the ORIGINAL header so the file keeps its password. The
         // trailer is written too, so a damaged primary header is repaired
@@ -996,16 +1074,11 @@ bool RelockFile(const std::filesystem::path& target, const UnlockResult& unlock)
         {
             std::ofstream o(tmpPath, std::ios::binary | std::ios::trunc);
             if (!o) return false;
-            EvFileHeader hdr = {};
-            std::memcpy(hdr.salt, unlock.salt.data(), 32);
-            std::memcpy(hdr.encKeyByPw, unlock.encKeyByPw.data(), 64);
-            std::memcpy(hdr.encKeyByMaster, unlock.encKeyByMaster.data(), 64);
             bool good = WriteEvfFile(o, hdr, enc);
             o.close();
             if (!good) { fs::remove(tmpPath); return false; }
         }
-        if (!MoveFileExW(tmpPath.c_str(), target.c_str(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        if (!ReplaceAtomically(tmpPath, target, true))
         {
             fs::remove(tmpPath);
             return false;
@@ -1018,27 +1091,81 @@ bool RelockFile(const std::filesystem::path& target, const UnlockResult& unlock)
 
 // ---- Change File Password ---------------------------------------
 
+static bool RewrapSingleFile(const fs::path& p, const std::wstring& oldPassword,
+    bool usingMaster, const std::vector<unsigned char>& master,
+    const std::vector<unsigned char>& newSalt, const std::vector<unsigned char>& newPwKey)
+{
+    if (newSalt.size() != 32 || newPwKey.size() != 32) return false;
+        try {
+            EvFileHeader hdr;
+            bool hasTrailer = false, authenticated = false;
+            EvHeaderState st = ReadEvHeader(p, hdr, hasTrailer, &authenticated);
+            if (st == EvHeaderState::None || st == EvHeaderState::Corrupt) { return false; }
+            std::vector<unsigned char> content;
+            if (!ReadPayload(p, hasTrailer, content)) { return false; }
+
+            std::vector<unsigned char> encKeyByPw(hdr.encKeyByPw, hdr.encKeyByPw + 64);
+            std::vector<unsigned char> encKeyByMaster(hdr.encKeyByMaster, hdr.encKeyByMaster + 64);
+
+            std::vector<unsigned char> fileKey;
+            if (usingMaster)
+                fileKey = DecryptBuffer(encKeyByMaster, master);
+            else {
+                auto key = DeriveKey(oldPassword, std::vector<unsigned char>(hdr.salt, hdr.salt + 32));
+                fileKey = DecryptBuffer(encKeyByPw, key);
+                SecureZeroMemory(key.data(), key.size());
+            }
+            if (fileKey.size() != 32) { return false; }
+
+            std::vector<unsigned char> plain;
+            if (!DecryptChecked(content, fileKey, plain,
+                    authenticated ? HeaderAAD(hdr) : std::vector<unsigned char>{}, authenticated))
+            { return false; }
+            auto newEncKeyByPw = EncryptAuthenticated(fileKey, newPwKey);
+            if (newEncKeyByPw.size() != 64) { return false; }
+
+            EvFileHeader newHdr = {};
+            std::memcpy(newHdr.salt, newSalt.data(), 32);
+            std::memcpy(newHdr.encKeyByPw, newEncKeyByPw.data(), 64);
+            std::memcpy(newHdr.encKeyByMaster, hdr.encKeyByMaster, 64);
+
+            content = EncryptAuthenticated(plain, fileKey, HeaderAAD(newHdr));
+            SecureZeroMemory(plain.data(), plain.size());
+            SecureZeroMemory(fileKey.data(), fileKey.size());
+            if (content.empty()) { return false; }
+
+            // Rewrite the whole file atomically so BOTH header copies
+            // (primary + trailer) carry the new password.
+            fs::path tmpPath = TempPathFor(p);
+            {
+                std::ofstream o(tmpPath, std::ios::binary | std::ios::trunc);
+                if (!o) { return false; }
+                bool good = WriteEvfFile(o, newHdr, content);
+                o.close();
+                if (!good) { fs::remove(tmpPath); return false; }
+            }
+            if (!ReplaceAtomically(tmpPath, p, true))
+            {
+                fs::remove(tmpPath);
+                return false;
+            }
+            EvRegister(p.wstring());   // driver: keep the path gated
+            return true;
+        } catch (...) {
+            return false;
+        }
+
+}
+
 bool ChangeFilePassword(const std::filesystem::path& target)
 {
     EvGate gate(target);   // driver: allow reads during this operation
 
-    std::vector<fs::path> evFiles;
-    if (fs::is_regular_file(target)) {
-        if (!IsEncrypted(target)) {
-            ShowError(L"EchoVault", L"Selected file is not an encrypted file.");
-            return false;
-        }
-        evFiles.push_back(target);
-    } else if (fs::is_directory(target)) {
-        for (auto& entry : fs::recursive_directory_iterator(target, fs::directory_options::skip_permission_denied)) {
-            if (entry.is_regular_file() && IsEncrypted(entry.path()))
-                evFiles.push_back(entry.path());
-        }
-        if (evFiles.empty()) {
-            ShowError(L"EchoVault", L"No encrypted files found in this folder.");
-            return false;
-        }
-    } else {
+    std::vector<fs::path> selected, evFiles;
+    if (!CollectTargetFiles(target, selected)) return false;
+    for (const auto& p : selected) if (IsEncrypted(p)) evFiles.push_back(p);
+    if (evFiles.empty()) {
+        ShowError(L"EchoVault", L"No encrypted files found. Nothing was changed.");
         return false;
     }
 
@@ -1049,6 +1176,7 @@ bool ChangeFilePassword(const std::filesystem::path& target)
     }
 
     std::vector<unsigned char> oldPwKey;
+    std::wstring oldPassword;
     bool usingMaster = false;
     for (;;) {
         auto a1 = PromptPassword(
@@ -1062,21 +1190,10 @@ bool ChangeFilePassword(const std::filesystem::path& target)
             break;
         }
 
-        oldPwKey = DeriveKey(a1.password, sampleSalt);
-        
-        std::ifstream in(evFiles[0], std::ios::binary);
-        if (!in) continue;
-        in.seekg(36); 
-        std::vector<unsigned char> encKeyByPw(64);
-        in.read(reinterpret_cast<char*>(encKeyByPw.data()), 64);
-        in.close();
-
-        auto fk = DecryptBuffer(encKeyByPw, oldPwKey);
-        if (fk.size() == 32) {
-            break; 
-        } else {
-            ShowError(L"EchoVault", L"Incorrect File Password. Try again.");
-        }
+        oldPassword = a1.password;
+        oldPwKey = DeriveKey(oldPassword, sampleSalt);
+        if (DecryptSingleFile(evFiles.front(), oldPwKey, {}, false, true) == 1) break;
+        ShowError(L"EchoVault", L"Incorrect password or damaged file. Nothing was changed.");
     }
 
     std::wstring newPw;
@@ -1103,69 +1220,18 @@ bool ChangeFilePassword(const std::filesystem::path& target)
 
     auto newSalt = GenerateRandomBytes(32);
     auto newPwKey = DeriveKey(newPw, newSalt);
+    if (newSalt.size() != 32 || newPwKey.size() != 32) return false;
 
     int ok = 0, fail = 0;
     auto master = usingMaster ? GetMasterKeyOnDemand() : std::vector<unsigned char>{};
-    for (auto& p : evFiles) {
-        try {
-            EvFileHeader hdr;
-            bool hasTrailer = false;
-            EvHeaderState st = ReadEvHeader(p, hdr, hasTrailer);
-            if (st == EvHeaderState::None || st == EvHeaderState::Corrupt)
-            { fail++; continue; }
-
-            std::ifstream in(p, std::ios::binary | std::ios::ate);
-            if (!in) { fail++; continue; }
-            auto sz = static_cast<size_t>(in.tellg());
-            size_t contentSize = sz - kPrimaryHeaderSize - (hasTrailer ? kTrailerSize : 0);
-            if (contentSize < 16) { fail++; continue; }
-            in.seekg(kPrimaryHeaderSize);
-            std::vector<unsigned char> content(contentSize);
-            in.read(reinterpret_cast<char*>(content.data()), contentSize);
-            in.close();
-
-            std::vector<unsigned char> encKeyByPw(hdr.encKeyByPw, hdr.encKeyByPw + 64);
-            std::vector<unsigned char> encKeyByMaster(hdr.encKeyByMaster, hdr.encKeyByMaster + 64);
-
-            std::vector<unsigned char> fileKey;
-            if (usingMaster)
-                fileKey = DecryptBuffer(encKeyByMaster, master);
-            else
-                fileKey = DecryptBuffer(encKeyByPw, oldPwKey);
-            if (fileKey.size() != 32) { fail++; continue; }
-
-            auto newEncKeyByPw = EncryptBuffer(fileKey, newPwKey);
-            if (newEncKeyByPw.size() != 64) { fail++; continue; }
-
-            EvFileHeader newHdr = {};
-            std::memcpy(newHdr.salt, newSalt.data(), 32);
-            std::memcpy(newHdr.encKeyByPw, newEncKeyByPw.data(), 64);
-            std::memcpy(newHdr.encKeyByMaster, hdr.encKeyByMaster, 64);
-
-            // Rewrite the whole file atomically so BOTH header copies
-            // (primary + trailer) carry the new password.
-            fs::path tmpPath = TempPathFor(p);
-            {
-                std::ofstream o(tmpPath, std::ios::binary | std::ios::trunc);
-                if (!o) { fail++; continue; }
-                bool good = WriteEvfFile(o, newHdr, content);
-                o.close();
-                if (!good) { fs::remove(tmpPath); fail++; continue; }
-            }
-            if (!MoveFileExW(tmpPath.c_str(), p.c_str(),
-                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
-            {
-                fs::remove(tmpPath);
-                fail++;
-                continue;
-            }
-            EvRegister(p.wstring());   // driver: keep the path gated
-            ok++;
-        } catch (...) {
-            fail++;
-        }
+    if (usingMaster && master.size() != 32) return false;
+    for (const auto& p : evFiles) {
+        if (RewrapSingleFile(p, oldPassword, usingMaster, master, newSalt, newPwKey)) ++ok;
+        else ++fail;
     }
-
+    SecureZeroMemory(oldPassword.data(), oldPassword.size() * sizeof(wchar_t));
+    SecureZeroMemory(oldPwKey.data(), oldPwKey.size());
+    SecureZeroMemory(newPwKey.data(), newPwKey.size());
     std::wstring msg = L"Password Change complete.\n\n"
         L"Succeeded: " + std::to_wstring(ok) + L"\n"
         L"Failed: "    + std::to_wstring(fail);
@@ -1177,7 +1243,7 @@ bool ChangeFilePassword(const std::filesystem::path& target)
 
 // ---- Headless self-test (EchoVault.exe --selftest) --------------
 
-int RunSelfTest()
+int RunSelfTest(const fs::path& outputDirectory)
 {
     int fails = 0;
     std::wstring log;
@@ -1190,11 +1256,15 @@ int RunSelfTest()
         if (!ok) fails++;
     };
 
-    // ---- Isolated sandbox dir next to vault.db ----
-    fs::path dir = GetVaultDirectory() / L"selftest";
+    // Every invocation owns a fresh test directory. Never clear a shared
+    // directory or touch the user's vault database during a test.
+    fs::path base = outputDirectory.empty() ? fs::temp_directory_path() / L"EchoVault-tests" : outputDirectory;
     std::error_code ec;
-    fs::remove_all(dir, ec);
+    fs::create_directories(base, ec);
+    if (ec) return 2;
+    fs::path dir = base / (L"run-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()));
     fs::create_directories(dir, ec);
+    if (ec) return 2;
     fs::path file = dir / L"data.txt";
 
     const std::wstring pw = L"selftest-pw-123";
@@ -1213,6 +1283,7 @@ int RunSelfTest()
         std::vector<unsigned char> v;
         std::ifstream in(p, std::ios::binary | std::ios::ate);
         auto s = in.tellg();
+        if (!in || s < 0) { check(false, L"test file could not be read"); return v; }
         in.seekg(0);
         v.resize(static_cast<size_t>(s));
         if (s > 0) in.read(reinterpret_cast<char*>(v.data()), s);
@@ -1225,10 +1296,14 @@ int RunSelfTest()
     };
     auto damage = [&](const fs::path& p, std::streamoff off, size_t n)
     {
+        DWORD attrs = GetFileAttributesW(p.c_str());
+        SetFileAttributesW(p.c_str(), attrs & ~FILE_ATTRIBUTE_READONLY);
         std::fstream f(p, std::ios::in | std::ios::out | std::ios::binary);
         std::vector<unsigned char> junk(n, 0x5A);   // 'Z' — clearly not original
         f.seekp(off);
         f.write(reinterpret_cast<char*>(junk.data()), n);
+        f.close();
+        SetFileAttributesW(p.c_str(), attrs);
     };
 
     line(L"== EchoVault self-test ==");
@@ -1240,10 +1315,12 @@ int RunSelfTest()
     }
     check(!IsEncrypted(file), L"plain file not flagged as encrypted");
     check(EncryptSingleFile(file, pwKey, salt, masterKey), L"encrypt succeeds");
-    check(IsEncrypted(file), L"encrypted file detected (EVF3)");
+    check(IsEncrypted(file), L"encrypted file detected (EVF4)");
+    check(IsReadOnlyFile(file), L"encrypted file is read-only against accidental overwrite");
     check(DecryptSingleFile(file, pwKey, {}, false) == 1, L"decrypt round-trip succeeds");
     check(contentMatches(readAll(file)), L"round-trip content matches");
     check(!IsEncrypted(file), L"file plain after decrypt");
+    check(!IsReadOnlyFile(file), L"decrypted file is writable again");
 
     // ---- Re-lock path (used after auto-unlock) ----
     {
@@ -1255,6 +1332,7 @@ int RunSelfTest()
         ul.fileKey = fileKey;
         check(RelockFile(file, ul), L"relock succeeds");
         check(IsEncrypted(file), L"relocked file detected");
+        check(IsReadOnlyFile(file), L"relocked file is read-only again");
         check(DecryptSingleFile(file, pwKey, {}, false) == 1, L"decrypt after relock");
         check(contentMatches(readAll(file)), L"relock round-trip content matches");
     }
@@ -1314,11 +1392,13 @@ int RunSelfTest()
         damage(file, 0, 4);
         damage(file, static_cast<std::streamoff>(sz) -
                           static_cast<std::streamoff>(kTrailerSize), 4);
-        check(!IsEncrypted(file),
-              L"both copies destroyed -> treated as plain (unrecoverable by design)");
-        check(DecryptSingleFile(file, pwKey, {}, false) == -1,
-              L"destroyed file refused, never written");
+        check(IsEncrypted(file), L"payload recognizes file after both outer markers damaged");
+        check(DecryptSingleFile(file, pwKey, {}, false) == 1,
+              L"both outer markers recovered using authenticated header and payload");
+        check(contentMatches(readAll(file)), L"content matches after both markers damaged");
     }
+
+    #include "tests/file-safety-cases.inc"
 
     // ---- No stray temp files left behind ----
     {
@@ -1329,13 +1409,16 @@ int RunSelfTest()
         check(temps == 0, L"no stray temp files left");
     }
 
+    for (auto& entry : fs::directory_iterator(dir, ec))
+        if (entry.is_regular_file()) SetFileAttributesW(entry.path().c_str(), FILE_ATTRIBUTE_NORMAL);
     fs::remove_all(dir, ec);
 
     line(fails == 0 ? L"ALL TESTS PASSED" : L"SOME TESTS FAILED");
 
     // Write the log next to vault.db so it is easy to find.
     {
-        std::ofstream f(GetVaultDirectory() / L"selftest.log", std::ios::trunc);
+        std::ofstream f(base / L"selftest.log", std::ios::trunc);
+        if (!f) return 2;
         for (auto& ch : log)
             f << static_cast<char>(ch);
     }

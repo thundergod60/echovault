@@ -64,7 +64,7 @@ bool DecryptTarget(const std::filesystem::path& target, bool showResult = true);
 
 // ---- Temporary unlock (auto re-lock on close) ----
 
-// Everything needed to re-encrypt a file back to EVF2 with the SAME
+// Everything needed to re-encrypt a file into EVF4 with the SAME
 // password: the original header fields plus the recovered file key.
 struct UnlockResult
 {
@@ -80,7 +80,7 @@ struct UnlockResult
 // failure returns success=false and leaves the file untouched.
 UnlockResult UnlockFileForOpen(const std::filesystem::path& target);
 
-// Re-encrypts a plain file back into EVF2 using the ORIGINAL header, so
+// Re-encrypts a plain file into EVF4 using the ORIGINAL header, so
 // the file keeps its existing password. No-op (returns true) if the file
 // is already encrypted. Returns false if the file is locked or writing fails.
 bool RelockFile(const std::filesystem::path& target, const UnlockResult& unlock);
@@ -90,5 +90,5 @@ bool RelockFile(const std::filesystem::path& target, const UnlockResult& unlock)
 // Exercises the file-format layer with no UI: encrypt/decrypt round-trip,
 // re-lock, recovery from a damaged signature (leading magic / salt edited),
 // and refusal when both header copies are destroyed. Returns 0 on success,
-// non-zero if any check failed; writes a log next to vault.db.
-int RunSelfTest();
+// non-zero if any check failed; writes a log under the chosen test directory.
+int RunSelfTest(const std::filesystem::path& outputDirectory = {});

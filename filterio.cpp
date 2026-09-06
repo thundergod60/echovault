@@ -1,3 +1,16 @@
+#include "filterio.h"
+
+#ifndef ECHOVAULT_EXPERIMENTAL_DRIVER
+// Normal application builds cannot contact a minifilter, even if an old
+// experimental driver happens to be installed or loaded on the machine.
+bool EvFilterAvailable() { return false; }
+bool EvPortSend(unsigned long, const std::wstring&) { return false; }
+void EvAllowFor(const std::wstring&) {}
+void EvDenyFor(const std::wstring&) {}
+void EvRegister(const std::wstring&) {}
+void EvUnregister(const std::wstring&) {}
+int EvGuardLoop(const std::function<void(const std::wstring&, const std::wstring&)>&) { return 3; }
+#else
 //------------------------------------------------------------
 // filterio.cpp — user-mode access to the EchoVault minifilter
 //
@@ -209,3 +222,4 @@ int EvGuardLoop(const std::function<void(const std::wstring&, const std::wstring
     g_portRole = 0;
     return 0;
 }
+#endif

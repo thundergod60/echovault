@@ -7,6 +7,8 @@
 #include <windows.h>
 #include <bcrypt.h>
 #include <algorithm>
+#include <cstring>
+#include <limits>
 
 // MinGW may not define NT_SUCCESS
 #ifndef NT_SUCCESS
@@ -90,7 +92,7 @@ bool VerifyPassword(
     const std::vector<unsigned char>& expectedHash)
 {
     auto hash = HashPassword(password, salt);
-    if (hash.size() != expectedHash.size()) return false;
+    if (hash.size() != HASH_SIZE || expectedHash.size() != HASH_SIZE) return false;
 
     // Constant-time comparison
     unsigned char diff = 0;
@@ -162,21 +164,28 @@ std::vector<unsigned char> EncryptBuffer(
         return {};
     }
 
+    unsigned char emptyInput = 0;
+    PUCHAR input = plaintext.empty() ? &emptyInput : const_cast<PUCHAR>(plaintext.data());
     // --- First call: query output size ---
     auto ivTmp = iv;
     ULONG ctLen = 0;
-    BCryptEncrypt(hKey,
-        const_cast<PUCHAR>(plaintext.data()),
+    NTSTATUS queryStatus = BCryptEncrypt(hKey,
+        input,
         static_cast<ULONG>(plaintext.size()),
         nullptr,
         ivTmp.data(), static_cast<ULONG>(ivTmp.size()),
         nullptr, 0, &ctLen, BCRYPT_BLOCK_PADDING);
 
+    if (!NT_SUCCESS(queryStatus) || ctLen == 0) {
+        BCryptDestroyKey(hKey);
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        return {};
+    }
     // --- Second call: encrypt ---
     std::vector<unsigned char> ct(ctLen);
     ivTmp = iv;                                 // reset IV
     NTSTATUS st = BCryptEncrypt(hKey,
-        const_cast<PUCHAR>(plaintext.data()),
+        input,
         static_cast<ULONG>(plaintext.size()),
         nullptr,
         ivTmp.data(), static_cast<ULONG>(ivTmp.size()),
@@ -203,6 +212,12 @@ std::vector<unsigned char> DecryptBuffer(
     const std::vector<unsigned char>& data,
     const std::vector<unsigned char>& key)
 {
+    if (data.size() >= 4 && std::memcmp(data.data(), "EVG4", 4) == 0)
+    {
+        std::vector<unsigned char> plain;
+        if (!DecryptChecked(data, key, plain, {}, true)) return {};
+        return plain;
+    }
     if (key.size() != KEY_SIZE || data.size() <= IV_SIZE) return {};
 
     BCRYPT_ALG_HANDLE hAlg = nullptr;
@@ -264,6 +279,96 @@ std::vector<unsigned char> DecryptBuffer(
 //------------------------------------------------------------
 // Hex helpers
 //------------------------------------------------------------
+
+namespace {
+struct GcmKey {
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    BCRYPT_KEY_HANDLE key = nullptr;
+    ~GcmKey() { if (key) BCryptDestroyKey(key); if (alg) BCryptCloseAlgorithmProvider(alg, 0); }
+    bool init(const std::vector<unsigned char>& bytes) {
+        return bytes.size() == 32 &&
+            NT_SUCCESS(BCryptOpenAlgorithmProvider(&alg, BCRYPT_AES_ALGORITHM, nullptr, 0)) &&
+            NT_SUCCESS(BCryptSetProperty(alg, BCRYPT_CHAINING_MODE,
+                (PUCHAR)BCRYPT_CHAIN_MODE_GCM, sizeof(BCRYPT_CHAIN_MODE_GCM), 0)) &&
+            NT_SUCCESS(BCryptGenerateSymmetricKey(alg, &key, nullptr, 0,
+                const_cast<PUCHAR>(bytes.data()), 32, 0));
+    }
+};
+}
+
+std::vector<unsigned char> EncryptAuthenticated(const std::vector<unsigned char>& plain,
+    const std::vector<unsigned char>& key, const std::vector<unsigned char>& associated)
+{
+    if (plain.size() > (std::numeric_limits<ULONG>::max)() || associated.size() > (std::numeric_limits<ULONG>::max)()) return {};
+    GcmKey k;
+    if (!k.init(key)) return {};
+    auto nonce = GenerateRandomBytes(12);
+    if (nonce.size() != 12) return {};
+    std::vector<unsigned char> out(32 + plain.size());
+    std::memcpy(out.data(), "EVG4", 4);
+    std::memcpy(out.data() + 4, nonce.data(), 12);
+    BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO info;
+    BCRYPT_INIT_AUTH_MODE_INFO(info);
+    info.pbNonce = out.data() + 4; info.cbNonce = 12;
+    info.pbTag = out.data() + 16; info.cbTag = 16;
+    info.pbAuthData = const_cast<PUCHAR>(associated.data()); info.cbAuthData = (ULONG)associated.size();
+    unsigned char dummy = 0;
+    ULONG written = 0;
+    NTSTATUS status = BCryptEncrypt(k.key, plain.empty() ? &dummy : const_cast<PUCHAR>(plain.data()),
+        (ULONG)plain.size(), &info, nullptr, 0, plain.empty() ? &dummy : out.data() + 32,
+        (ULONG)plain.size(), &written, 0);
+    if (!NT_SUCCESS(status) || written != plain.size()) return {};
+    return out;
+}
+
+bool DecryptChecked(const std::vector<unsigned char>& data,
+    const std::vector<unsigned char>& key, std::vector<unsigned char>& plain,
+    const std::vector<unsigned char>& associated, bool requireAuthenticated)
+{
+    plain.clear();
+    bool gcm = data.size() >= 4 && std::memcmp(data.data(), "EVG4", 4) == 0;
+    if (!gcm) {
+        if (requireAuthenticated || !associated.empty()) return false;
+        plain = DecryptBuffer(data, key);
+        if (!plain.empty()) return true;
+        // Legacy CBC empty files need an explicit success result; a zero
+        // length vector alone cannot distinguish valid empty from failure.
+        if (key.size() != 32 || data.size() != 32) return false;
+        BCRYPT_ALG_HANDLE alg = nullptr; BCRYPT_KEY_HANDLE kh = nullptr;
+        bool ok = false;
+        if (NT_SUCCESS(BCryptOpenAlgorithmProvider(&alg, BCRYPT_AES_ALGORITHM, nullptr, 0)) &&
+            NT_SUCCESS(BCryptSetProperty(alg, BCRYPT_CHAINING_MODE, (PUCHAR)BCRYPT_CHAIN_MODE_CBC,
+                sizeof(BCRYPT_CHAIN_MODE_CBC), 0)) &&
+            NT_SUCCESS(BCryptGenerateSymmetricKey(alg, &kh, nullptr, 0, const_cast<PUCHAR>(key.data()), 32, 0))) {
+            unsigned char iv[16], output[16]; ULONG written = 0;
+            std::memcpy(iv, data.data(), 16);
+            ok = NT_SUCCESS(BCryptDecrypt(kh, const_cast<PUCHAR>(data.data()+16), 16, nullptr,
+                iv, 16, output, 16, &written, BCRYPT_BLOCK_PADDING)) && written == 0;
+            SecureZeroMemory(output, sizeof(output));
+        }
+        if (kh) BCryptDestroyKey(kh);
+        if (alg) BCryptCloseAlgorithmProvider(alg, 0);
+        return ok;
+    }
+    if (data.size() < 32 || data.size()-32 > (std::numeric_limits<ULONG>::max)() || associated.size() > (std::numeric_limits<ULONG>::max)()) return false;
+    GcmKey k;
+    if (!k.init(key)) return false;
+    BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO info;
+    BCRYPT_INIT_AUTH_MODE_INFO(info);
+    info.pbNonce = const_cast<PUCHAR>(data.data()+4); info.cbNonce = 12;
+    info.pbTag = const_cast<PUCHAR>(data.data()+16); info.cbTag = 16;
+    info.pbAuthData = const_cast<PUCHAR>(associated.data()); info.cbAuthData = (ULONG)associated.size();
+    plain.resize(data.size()-32);
+    unsigned char dummy = 0; ULONG written = 0;
+    NTSTATUS status = BCryptDecrypt(k.key, plain.empty() ? &dummy : const_cast<PUCHAR>(data.data()+32),
+        (ULONG)plain.size(), &info, nullptr, 0, plain.empty() ? &dummy : plain.data(),
+        (ULONG)plain.size(), &written, 0);
+    if (!NT_SUCCESS(status) || written != plain.size()) {
+        if (!plain.empty()) SecureZeroMemory(plain.data(), plain.size());
+        plain.clear(); return false;
+    }
+    return true;
+}
 
 std::wstring BytesToHex(const std::vector<unsigned char>& bytes)
 {
