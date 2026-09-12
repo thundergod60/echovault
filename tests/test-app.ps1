@@ -21,6 +21,9 @@ $uiSource = Get-Content -LiteralPath (Join-Path $sourceRoot 'ui.cpp') -Raw
 if ($uiSource -match 'lpVerb\s*=\s*L"openas"') {
     throw 'Unsafe asynchronous Open With fallback was reintroduced.'
 }
+if ($uiSource -notmatch 'OAIF_EXEC\s*\|\s*OAIF_HIDE_REGISTRATION') {
+    throw 'Open With must execute the selected editor without allowing it to replace EchoVault as the default.'
+}
 $commonBlock = [regex]::Match(
     $uiSource,
     'static const wchar_t\* kCommonExtensions\[\] = \{(?<body>.*?)\};',
@@ -30,7 +33,7 @@ $commonCount = ([regex]::Matches($commonBlock, 'L"\.[a-z0-9]+"')).Count
 if ($commonCount -lt 50) {
     throw "Common file type registration is incomplete ($commonCount entries found)."
 }
-Write-Output "PASS modal Open With source guard"
+Write-Output "PASS modal non-registering Open With source guard"
 Write-Output "PASS common file type registration source guard ($commonCount entries found)"
 foreach ($scriptType in @('.bat','.cmd','.ps1','.vbs','.js','.mjs','.cjs','.py','.pyw','.rb','.php','.lua','.sh','.ahk')) {
     if ($commonBlock -match [regex]::Escape('L"' + $scriptType + '"')) {

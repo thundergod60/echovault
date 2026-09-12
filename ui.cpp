@@ -1272,10 +1272,13 @@ unsigned long OpenWithOriginalApp(const std::filesystem::path& filePath,
             // SHOpenWithDialog is modal. OAIF_EXEC waits for the user's
             // selection before starting that app, so EchoVault's later
             // "save, close, then lock" dialog cannot race ahead of it.
+            // OAIF_HIDE_REGISTRATION removes the "always use" choice: the
+            // editor selected for this unlocked session must never replace
+            // EchoVault as the extension's double-click handler.
             OPENASINFO info = {};
             info.pcszFile = filePath.c_str();
             info.pcszClass = nullptr;
-            info.oaifInFlags = OAIF_EXEC;
+            info.oaifInFlags = OAIF_EXEC | OAIF_HIDE_REGISTRATION;
             if (SUCCEEDED(SHOpenWithDialog(nullptr, &info)))
                 return 1; // launched, but Windows does not expose a useful PID
             ShowError(L"EchoVault",

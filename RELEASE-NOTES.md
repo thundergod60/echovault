@@ -33,7 +33,8 @@ test this app. Driver source remains in the repository for separate research.
 - Opening a document asks the user to save/close and explicitly confirm re-locking.
   An editor launcher exiting is no longer treated as proof the document closed.
   The fallback Open With dialog is modal and starts the selected app before the
-  re-lock confirmation appears, eliminating the encrypted-file launch race.
+  re-lock confirmation appears, eliminating the encrypted-file launch race. Its
+  default-app control is hidden so the selected editor cannot displace EchoVault.
 - A 127 MiB plaintext limit bounds memory allocations for this preview.
 - Files with multiple hard links or named streams are refused rather than
   leaving an unencrypted alias or silently dropping stream contents.

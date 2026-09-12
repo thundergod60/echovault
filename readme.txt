@@ -70,6 +70,8 @@ override Windows' choice. Use Open with EchoVault, the main menu, or change the
 default back in Windows Settings. Do not edit or save the encrypted bytes.
 If no original application is known, EchoVault shows Windows' single-file Open
 With dialog while the file is unlocked, then waits for you to save and close it.
+That picker is for the current unlocked session only: it cannot make the editor
+the extension's default and therefore cannot displace EchoVault for the next open.
 There is no background takeover, scheduled guard, or startup watcher in this build.
 The compatibility --watch mode only updates association-status.txt; it is not
 started automatically. Explorer setup and status refreshes the same report.
